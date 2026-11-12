@@ -12,12 +12,14 @@ import html
 import json
 import logging
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 
 import httpx
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -27,11 +29,13 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     Defaults,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -44,6 +48,7 @@ from config import (
     DEFAULT_TERMS,
     ENRICH_BATCH,
     ENRICH_INTERVAL_MIN,
+    OWNER_IDS,
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -67,6 +72,210 @@ def de_date(iso: str) -> str:
         return datetime.strptime(iso, "%Y-%m-%d").strftime("%d.%m.%Y")
     except ValueError:
         return iso
+
+
+# ================================================================= доступ
+
+REQUEST_COOLDOWN = 12 * 3600   # не чаще одного запроса доступа от человека за 12 часов
+DENY_SILENCE = 7 * 24 * 3600   # после отказа — неделю без новых запросов
+
+
+def user_name(user) -> str:
+    name = user.full_name or str(user.id)
+    return f"{name} (@{user.username})" if user.username else name
+
+
+def setup_access() -> None:
+    """Назначает владельца при запуске.
+
+    1) OWNER_ID из переменных окружения; 2) если владельца нет, а подписчик ровно один —
+    он и становится владельцем; 3) иначе в лог пишется одноразовый код для /claim.
+    """
+    for uid in OWNER_IDS:
+        db.add_user(uid, "", "owner")
+    if db.owner_ids():
+        db.set_meta("claim_code", "")
+        return
+    subs = db.private_subscribers()
+    if len(subs) == 1:
+        db.add_user(subs[0], "", "owner")
+        db.set_meta("owner_greet", str(subs[0]))
+        log.info("Владельцем назначен единственный подписчик %s", subs[0])
+        return
+    code = secrets.token_hex(4)
+    db.set_meta("claim_code", code)
+    log.warning("🔐 Владелец бота не назначен. Отправь боту: /claim %s  "
+                "(или задай переменную OWNER_ID со своим Telegram ID)", code)
+
+
+async def set_owner_commands(bot, owner_id: int) -> None:
+    try:
+        await bot.set_my_commands(USER_COMMANDS + OWNER_COMMANDS, scope=BotCommandScopeChat(owner_id))
+    except TelegramError as err:
+        log.warning("Не удалось задать меню владельцу %s: %s", owner_id, err)
+
+
+async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    """Отказ незнакомцу и запрос владельцу с кнопками «Пустить / Отклонить»."""
+    requests = context.bot_data.setdefault("access_requests", {})
+    now = time.time()
+    send = now >= requests.get(user.id, 0)
+    if update.callback_query:
+        await update.callback_query.answer("🔒 Нет доступа", show_alert=True)
+    elif update.message:
+        status = ("Я отправил владельцу запрос на доступ." if send and db.owner_ids()
+                  else "Попроси владельца бота добавить тебя.")
+        await update.message.reply_text(
+            "🔒 Это личный бот: пользоваться им могут только те, кого добавил владелец.\n\n"
+            f"Твой Telegram ID: <code>{user.id}</code>\n{status}"
+        )
+    if not send:
+        return
+    requests[user.id] = now + REQUEST_COOLDOWN
+    context.bot_data.setdefault("pending_names", {})[user.id] = user_name(user)
+    kb = InlineKeyboardMarkup([[B("✅ Пустить", f"acc:ok:{user.id}"), B("❌ Отклонить", f"acc:no:{user.id}")]])
+    for owner in db.owner_ids():
+        try:
+            await context.bot.send_message(
+                owner, f"🔐 Запрос доступа к боту:\n<b>{esc(user_name(user))}</b>, ID <code>{user.id}</code>",
+                reply_markup=kb,
+            )
+        except TelegramError as err:
+            log.warning("Не удалось отправить запрос владельцу %s: %s", owner, err)
+
+
+async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пропускает дальше только пользователей из whitelist (группа -1, до всех хендлеров)."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is None or (chat is not None and chat.type != "private"):
+        raise ApplicationHandlerStop  # только личные чаты
+    if db.is_allowed(user.id):
+        db.set_user_name(user.id, user_name(user))
+        return
+    text = (update.message.text or "").strip() if update.message else ""
+
+    # приглашение: /start inv_<токен>
+    m = re.match(r"^/start\s+inv_([\w-]+)$", text)
+    if m:
+        inviter = db.use_invite(m[1], user.id)
+        if inviter is not None:
+            db.add_user(user.id, user_name(user), "user", inviter)
+            log.info("По приглашению добавлен %s (%s)", user.id, user_name(user))
+            try:
+                await context.bot.send_message(inviter, f"✅ По твоей ссылке присоединился <b>{esc(user_name(user))}</b>.")
+            except TelegramError:
+                pass
+            return  # дальше обычный /start
+        await update.message.reply_text("Ссылка-приглашение недействительна или уже использована.")
+        raise ApplicationHandlerStop
+
+    # назначение владельца одноразовым кодом из логов: /claim <код>
+    m = re.match(r"^/claim\s+(\w+)$", text)
+    code = db.get_meta("claim_code") or ""
+    if m and code and not db.owner_ids() and secrets.compare_digest(m[1], code):
+        db.add_user(user.id, user_name(user), "owner")
+        db.set_meta("claim_code", "")
+        await set_owner_commands(context.bot, user.id)
+        await update.message.reply_text("👑 Готово, теперь ты владелец бота. Нажми /start.")
+        raise ApplicationHandlerStop
+
+    await request_access(update, context, user)
+    raise ApplicationHandlerStop
+
+
+def users_view() -> tuple[str, InlineKeyboardMarkup]:
+    users = db.list_users()
+    lines = ["👥 <b>Доступ к боту</b>"]
+    rows = []
+    for u in users:
+        name = u["name"] or f"ID {u['user_id']}"
+        if u["role"] == "owner":
+            lines.append(f"👑 {esc(name)} — владелец")
+        else:
+            lines.append(f"• {esc(name)} — <code>{u['user_id']}</code>, с {de_date(u['added_at'][:10])}")
+            rows.append([B(f"❌ Убрать {name[:30]}", f"usr:del:{u['user_id']}")])
+    lines.append("\nДобавить человека: ссылка-приглашение (одноразовая, на 24 часа) "
+                 "или <code>/allow ID</code>.")
+    rows.append([B("➕ Создать ссылку-приглашение", "usr:inv")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def make_invite(context: ContextTypes.DEFAULT_TYPE, owner_id: int) -> str:
+    token = db.create_invite(owner_id)
+    link = f"https://t.me/{context.bot.username}?start=inv_{token}"
+    return (f"🔗 Ссылка-приглашение (одноразовая, действует 24 часа):\n{link}\n\n"
+            "Отправь её человеку: он откроет бота, нажмёт «Start» и сразу получит доступ.")
+
+
+async def on_access_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки владельца: запросы доступа и список пользователей."""
+    data, uid = query.data, query.from_user.id
+    if not db.is_owner(uid):
+        await query.answer("Только для владельца", show_alert=True)
+        return
+    await query.answer()
+    if data.startswith("acc:"):
+        _, action, target = data.split(":")
+        target = int(target)
+        name = context.bot_data.get("pending_names", {}).get(target, f"ID {target}")
+        if action == "ok":
+            db.add_user(target, name, "user", uid)
+            context.bot_data.get("access_requests", {}).pop(target, None)
+            try:
+                await context.bot.send_message(target, "✅ Владелец открыл тебе доступ. Нажми /start.")
+            except TelegramError:
+                pass
+            await edit(query, f"✅ Доступ открыт: <b>{esc(name)}</b>", None)
+        else:
+            context.bot_data.setdefault("access_requests", {})[target] = time.time() + DENY_SILENCE
+            await edit(query, f"❌ Отклонено: <b>{esc(name)}</b>", None)
+        return
+    if data.startswith("usr:del:"):
+        db.remove_user(int(data[8:]))
+    elif data == "usr:inv":
+        text = await make_invite(context, uid)
+        return await edit(query, text, InlineKeyboardMarkup([[B("⬅️ К списку", "usr:list")]]))
+    text, kb = users_view()
+    await edit(query, text, kb)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not db.is_owner(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для владельца.")
+        return
+    text, kb = users_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not db.is_owner(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для владельца.")
+        return
+    await update.message.reply_text(await make_invite(context, update.effective_user.id))
+
+
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not db.is_owner(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для владельца.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: <code>/allow 123456789</code> (Telegram ID человека).")
+        return
+    target = int(context.args[0])
+    name = " ".join(context.args[1:]) or context.bot_data.get("pending_names", {}).get(target, "")
+    db.add_user(target, name, "user", update.effective_user.id)
+    await update.message.reply_text(f"✅ Добавил ID <code>{target}</code>. Пусть напишет боту /start.")
+
+
+async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not db.is_owner(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для владельца.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: <code>/deny 123456789</code>.")
+        return
+    removed = db.remove_user(int(context.args[0]))
+    await update.message.reply_text("Убрал из списка." if removed else "Такого пользователя нет (или это владелец).")
 
 
 # =================================================== загрузка и уведомления
@@ -451,6 +660,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     data = query.data or ""
     chat_id = query.message.chat.id
+    if data.startswith(("acc:", "usr:")):
+        return await on_access_callback(query, context)
     await query.answer()
     if data == "noop":
         return
@@ -654,6 +865,7 @@ async def first_check(app: Application, chat_id: int) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     db.add_chat(chat_id)
+    db.set_user_name(update.effective_user.id, user_name(update.effective_user))
     s = db.get_settings(chat_id)
     text = (
         "Привет! Я ищу вакансии Ausbildung на сайте Bundesagentur für Arbeit, присылаю новые "
@@ -728,8 +940,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+OWNER_HELP = (
+    "\n\n<b>Доступ (только для тебя как владельца):</b>\n"
+    "/users — кто имеет доступ, убрать человека\n"
+    "/invite — одноразовая ссылка-приглашение на 24 часа\n"
+    "/allow ID — добавить по Telegram ID\n"
+    "/deny ID — убрать по Telegram ID"
+)
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP)
+    extra = OWNER_HELP if db.is_owner(update.effective_user.id) else ""
+    await update.message.reply_text(HELP + extra)
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -737,21 +959,43 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Отписал. /start — подписаться снова.")
 
 
+USER_COMMANDS = [
+    BotCommand("list", "Подходящие вакансии"),
+    BotCommand("settings", "Настройки поиска"),
+    BotCommand("check", "Проверить сейчас"),
+    BotCommand("stats", "Статистика"),
+    BotCommand("help", "Команды"),
+    BotCommand("stop", "Отписаться"),
+]
+OWNER_COMMANDS = [
+    BotCommand("users", "Доступ: кто пользуется ботом"),
+    BotCommand("invite", "Ссылка-приглашение"),
+]
+
+
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        BotCommand("list", "Подходящие вакансии"),
-        BotCommand("settings", "Настройки поиска"),
-        BotCommand("check", "Проверить сейчас"),
-        BotCommand("stats", "Статистика"),
-        BotCommand("help", "Команды"),
-        BotCommand("stop", "Отписаться"),
-    ])
+    await app.bot.set_my_commands(USER_COMMANDS)
+    for owner in db.owner_ids():
+        await set_owner_commands(app.bot, owner)
+    greet = db.get_meta("owner_greet")
+    if greet:
+        db.set_meta("owner_greet", "")
+        try:
+            await app.bot.send_message(
+                int(greet),
+                "🔐 Бот закрыт: пользоваться им можешь только ты и те, кого ты добавишь. "
+                "Ты — владелец.\n\n/users — список доступа\n/invite — пригласить человека по ссылке\n"
+                "Незнакомцы увидят «нет доступа», а тебе придёт запрос с кнопками «Пустить / Отклонить».",
+            )
+        except TelegramError as err:
+            log.warning("Не удалось поприветствовать владельца: %s", err)
 
 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN. Скопируй .env.example в .env и впиши токен.")
     db.init_db()
+    setup_access()
     defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     app = (
         Application.builder()
@@ -762,9 +1006,11 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
+    app.add_handler(TypeHandler(Update, gatekeeper), group=-1)  # whitelist до всех хендлеров
     for name, handler in (
         ("start", cmd_start), ("list", cmd_list), ("last", cmd_list), ("settings", cmd_settings),
         ("check", cmd_check), ("stats", cmd_stats), ("help", cmd_help), ("stop", cmd_stop),
+        ("users", cmd_users), ("invite", cmd_invite), ("allow", cmd_allow), ("deny", cmd_deny),
     ):
         app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_callback))

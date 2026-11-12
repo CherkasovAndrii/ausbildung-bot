@@ -2,6 +2,7 @@
 
 import copy
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -62,6 +63,20 @@ CHAT_COLUMNS = [
     ("settings", "TEXT DEFAULT ''"),
     ("notify_since", "TEXT DEFAULT ''"),
 ]
+USER_COLUMNS = [                            # whitelist: кто может пользоваться ботом
+    ("user_id", "INTEGER PRIMARY KEY"),
+    ("name", "TEXT DEFAULT ''"),
+    ("role", "TEXT DEFAULT 'user'"),        # owner / user
+    ("added_at", "TEXT DEFAULT ''"),
+    ("added_by", "INTEGER"),
+]
+INVITE_COLUMNS = [                          # одноразовые ссылки-приглашения
+    ("token", "TEXT PRIMARY KEY"),
+    ("created_by", "INTEGER"),
+    ("created_at", "TEXT DEFAULT ''"),
+    ("expires_at", "TEXT DEFAULT ''"),
+    ("used_by", "INTEGER"),
+]
 LIST_FIELDS = ", ".join(c for c, _ in JOB_COLUMNS if c != "beschreibung")
 
 
@@ -92,6 +107,8 @@ def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS notified (chat_id INTEGER, refnr TEXT, batch INTEGER, "
             "PRIMARY KEY (chat_id, refnr))"
         )
+        _create(con, "users", USER_COLUMNS)
+        _create(con, "invites", INVITE_COLUMNS)
     schema = get_meta("schema")
     with db() as con:
         if schema in (None, "1"):
@@ -158,8 +175,12 @@ def remove_chat(chat_id: int) -> None:
 
 
 def get_chats() -> list[dict]:
+    """Подписчики, у которых есть доступ (есть в whitelist)."""
     with db() as con:
-        rows = con.execute("SELECT chat_id, settings, notify_since FROM chats").fetchall()
+        rows = con.execute(
+            "SELECT chat_id, settings, notify_since FROM chats "
+            "WHERE chat_id IN (SELECT user_id FROM users)"
+        ).fetchall()
     return [
         {"chat_id": r["chat_id"], "settings": _load_settings(r["settings"]), "notify_since": r["notify_since"]}
         for r in rows
@@ -183,6 +204,84 @@ def save_settings(chat_id: int, settings: dict) -> None:
             "UPDATE chats SET settings=? WHERE chat_id=?",
             (json.dumps(settings, ensure_ascii=False), chat_id),
         )
+
+
+# ----------------------------------------------------- доступ (whitelist)
+
+
+def owner_ids() -> set[int]:
+    with db() as con:
+        return {r[0] for r in con.execute("SELECT user_id FROM users WHERE role='owner'")}
+
+
+def is_allowed(user_id: int) -> bool:
+    with db() as con:
+        return con.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone() is not None
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in owner_ids()
+
+
+def add_user(user_id: int, name: str = "", role: str = "user", added_by: int | None = None) -> None:
+    """Добавляет в whitelist. Владелец остаётся владельцем, имя обновляется, если передано."""
+    with db() as con:
+        con.execute(
+            "INSERT INTO users (user_id, name, role, added_at, added_by) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "role = CASE WHEN users.role='owner' THEN 'owner' ELSE excluded.role END, "
+            "name = CASE WHEN excluded.name != '' THEN excluded.name ELSE users.name END",
+            (user_id, name, role, now_str(), added_by),
+        )
+
+
+def set_user_name(user_id: int, name: str) -> None:
+    with db() as con:
+        con.execute("UPDATE users SET name=? WHERE user_id=? AND name != ?", (name, user_id, name))
+
+
+def remove_user(user_id: int) -> bool:
+    """Убирает из whitelist и отписывает. Владельца убрать нельзя."""
+    with db() as con:
+        cur = con.execute("DELETE FROM users WHERE user_id=? AND role != 'owner'", (user_id,))
+        if cur.rowcount:
+            con.execute("DELETE FROM chats WHERE chat_id=?", (user_id,))
+        return cur.rowcount > 0
+
+
+def list_users() -> list[dict]:
+    with db() as con:
+        rows = con.execute("SELECT * FROM users ORDER BY role='owner' DESC, added_at")
+        return [dict(r) for r in rows]
+
+
+def private_subscribers() -> list[int]:
+    with db() as con:
+        return [r[0] for r in con.execute("SELECT chat_id FROM chats WHERE chat_id > 0")]
+
+
+def create_invite(created_by: int, hours: int = 24) -> str:
+    token = secrets.token_urlsafe(12)
+    expires = (datetime.now() + timedelta(hours=hours)).strftime(FMT)
+    with db() as con:
+        con.execute(
+            "INSERT INTO invites (token, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, created_by, now_str(), expires),
+        )
+    return token
+
+
+def use_invite(token: str, user_id: int) -> int | None:
+    """Погашает приглашение. Возвращает ID того, кто пригласил, или None."""
+    with db() as con:
+        row = con.execute(
+            "SELECT created_by FROM invites WHERE token=? AND used_by IS NULL AND expires_at > ?",
+            (token, now_str()),
+        ).fetchone()
+        if not row:
+            return None
+        con.execute("UPDATE invites SET used_by=? WHERE token=?", (user_id, token))
+        return row[0]
 
 
 # --------------------------------------------------------------- вакансии

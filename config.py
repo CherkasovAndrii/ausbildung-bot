@@ -14,6 +14,10 @@ def _list(name: str, default: str = "") -> list[str]:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
+# Telegram ID владельцев бота (через ; или ,). Необязательно: без него владельцем
+# становится единственный подписчик или тот, кто отправит /claim-код из логов.
+OWNER_IDS = [int(x) for x in os.getenv("OWNER_ID", "").replace(",", ";").split(";") if x.strip().isdigit()]
+
 # Профессии по умолчанию для нового подписчика; дальше он меняет их в /settings
 DEFAULT_TERMS = _list(
     "SEARCH_TERMS",
