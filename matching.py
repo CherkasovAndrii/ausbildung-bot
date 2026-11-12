@@ -143,6 +143,27 @@ def is_dual(job: dict) -> bool:
     return "DUAL" in (job.get("art") or "").upper() or "duales studium" in text or "dual studieren" in text
 
 
+def city_distance(job: dict, city: dict) -> float | None:
+    if job.get("lat") is None or job.get("lon") is None:
+        return None
+    return distance_km(job["lat"], job["lon"], city["lat"], city["lon"])
+
+
+def in_city(job: dict, city: dict, only: bool) -> bool:
+    """Вакансия в радиусе города или (only=True) в самом городе.
+
+    «В самом городе»: название места начинается с названия города, а если есть
+    координаты — ещё и не дальше 25 км (чтобы Frankfurt (Oder) не попал во Frankfurt am Main).
+    """
+    dist = city_distance(job, city)
+    if not only:
+        return dist is not None and dist <= city["radius"]
+    key = re.split(r"[\s,/(-]", city["name"].strip().lower())[0]
+    if not key or not (job.get("ort") or "").lower().startswith(key):
+        return False
+    return dist is None or dist <= 25
+
+
 def nearest_city(job: dict, cities: list[dict]) -> tuple[dict, float] | None:
     if job.get("lat") is None or job.get("lon") is None or not cities:
         return None

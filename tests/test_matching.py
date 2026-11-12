@@ -116,3 +116,14 @@ def test_zeitarbeit_filter():
     assert evaluate(job(zeitarbeit=1), settings()) is not None
     assert evaluate(job(zeitarbeit=1), settings(no_zeitarbeit=True)) is None
     assert evaluate(job(zeitarbeit=0), settings(no_zeitarbeit=True)) is not None
+
+
+def test_in_city_radius_and_only_city():
+    from matching import in_city
+    cottbus = {"name": "Cottbus", "lat": 51.76, "lon": 14.33, "radius": 50}
+    assert in_city(job(), cottbus, only=True)
+    assert in_city(job(ort="Spremberg", lat=51.57, lon=14.37), cottbus, only=False)       # 21 км
+    assert not in_city(job(ort="Spremberg", lat=51.57, lon=14.37), cottbus, only=True)
+    assert not in_city(job(ort="Berlin", lat=52.52, lon=13.40), cottbus, only=False)      # ~110 км
+    ffm = {"name": "Frankfurt am Main", "lat": 50.11, "lon": 8.68, "radius": 50}
+    assert not in_city(job(ort="Frankfurt (Oder)", lat=52.34, lon=14.55), ffm, only=True)

@@ -404,7 +404,7 @@ async def notify_all(bot) -> int:
             continue
         batch = int(time.time())
         db.mark_notified(chat_id, list(matched_ids), batch)
-        text, kb = render_list(matched, 0, f"n{batch}", f"🆕 Новых подходящих вакансий: {len(matched)}")
+        text, kb = render_list(matched, s, f"n{batch}", f"🆕 Новых подходящих вакансий: {len(matched)}")
         try:
             await bot.send_message(chat_id, text, reply_markup=kb)
             total += len(matched)
@@ -468,44 +468,153 @@ def format_item(n: int, job: dict, badges: list[str]) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def render_list(matched: list, page: int, kind: str, title: str):
-    """Страница списка вакансий с кнопками листания. kind: a — все, n<batch> — новые."""
-    if not matched:
-        text = f"{title}\n\nНичего не подходит. Попробуй ослабить фильтры в настройках."
-        return text, InlineKeyboardMarkup([[B("⚙️ Настройки", "st:main")]])
-    pages = (len(matched) + PAGE_SIZE - 1) // PAGE_SIZE
-    page = max(0, min(page, pages - 1))
-    start = page * PAGE_SIZE
-    chunk = matched[start:start + PAGE_SIZE]
-    parts = [f"{title}\n<i>Сначала самые подходящие · {start + 1}–{start + len(chunk)} из {len(matched)}</i>"]
-    parts += [format_item(start + i + 1, job, badges) for i, (job, _, badges) in enumerate(chunk)]
-    nav = []
-    if page > 0:
-        nav.append(B("◀️", f"pg:{kind}:{page - 1}"))
-    nav.append(B(f"{page + 1}/{pages}", "noop"))
-    if page < pages - 1:
-        nav.append(B("▶️", f"pg:{kind}:{page + 1}"))
-    rows = [nav]
-    if pages > 3:
-        jump = [B("⏮ В начало", f"pg:{kind}:0")] if page > 0 else []
-        if page + 5 < pages:
-            jump.append(B("⏩ +5 стр.", f"pg:{kind}:{page + 5}"))
-        if jump:
-            rows.append(jump)
-    rows.append([B("⚙️ Настройки", "st:main")])
+SORTS = {"s": ("⭐ Лучшие", "Сначала самые подходящие"),
+         "d": ("📏 Ближе", "Сначала ближайшие"),
+         "n": ("🆕 Новые", "Сначала новые")}
+
+
+def pg(kind: str, flt: str, sort: str, page: int) -> str:
+    """callback_data страницы списка: вид, фильтр по городу, сортировка, страница."""
+    return f"pg:{kind}:{flt}:{sort}:{page}"
+
+
+def apply_view(matched: list, s: dict, flt: str, sort: str, ort_opts: list[str]):
+    """Фильтр по городу и сортировка поверх подходящих вакансий.
+
+    flt: '' — все; c<i> — в радиусе i-го города из настроек; co<i> — только в самом городе;
+    o<i> — место из экрана «По городам». Возвращает (вакансии, подпись, город или None, flt).
+    """
+    city, label = None, ""
+    m = re.match(r"^(co|c|o)(\d+)$", flt)
+    if m and m[1] in ("c", "co") and int(m[2]) < len(s["cities"]):
+        city, only = s["cities"][int(m[2])], m[1] == "co"
+        matched = [x for x in matched if matching.in_city(x[0], city, only)]
+        label = f"📍 только {city['name']}" if only else f"📍 {city['name']} и до {city['radius']} км"
+        # расстояние показываем до выбранного города
+        matched = [
+            (job, score, [b for b in badges if not b.startswith("📏")]
+             + ([f"📏 {d:.0f} км от {city['name']}"] if (d := matching.city_distance(job, city)) is not None else []))
+            for job, score, badges in matched
+        ]
+    elif m and m[1] == "o" and int(m[2]) < len(ort_opts):
+        ort = ort_opts[int(m[2])]
+        matched = [x for x in matched if (x[0]["ort"] or "") == ort]
+        label = f"🏙 {ort}"
+    else:
+        flt = ""
+
+    if sort == "d":
+        refs = [city] if city else s["cities"]
+        if refs:
+            def dist(x):
+                ds = [d for c in refs if (d := matching.city_distance(x[0], c)) is not None]
+                return min(ds) if ds else float("inf")
+            matched = sorted(matched, key=dist)
+    elif sort == "n":
+        matched = sorted(matched, key=lambda x: (x[0]["veroeffentlicht"] or "", x[0]["first_seen"] or ""), reverse=True)
+    return matched, label, city, flt
+
+
+def render_list(matched: list, s: dict, kind: str, title: str, flt: str = "", sort: str = "s",
+                page: int = 0, ort_opts: list[str] | None = None):
+    """Страница списка вакансий: фильтр по городам, сортировка, листание.
+
+    kind: a — все подходящие, n<batch> — пачка новых из уведомления.
+    """
+    if sort not in SORTS or (sort == "d" and not s["cities"]):
+        sort = "s"
+    matched, label, city, flt = apply_view(matched, s, flt, sort, ort_opts or [])
+    check = lambda on: "✅ " if on else ""  # noqa: E731
+    header = title + (f" · {esc(label)}" if label else "")
+
+    rows = []
+    if matched:
+        pages = (len(matched) + PAGE_SIZE - 1) // PAGE_SIZE
+        page = max(0, min(page, pages - 1))
+        start = page * PAGE_SIZE
+        chunk = matched[start:start + PAGE_SIZE]
+        parts = [f"{header}\n<i>{SORTS[sort][1]} · {start + 1}–{start + len(chunk)} из {len(matched)}</i>"]
+        parts += [format_item(start + i + 1, job, badges) for i, (job, _, badges) in enumerate(chunk)]
+        nav = []
+        if page > 0:
+            nav.append(B("◀️", pg(kind, flt, sort, page - 1)))
+        nav.append(B(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(B("▶️", pg(kind, flt, sort, page + 1)))
+        rows.append(nav)
+        if pages > 3:
+            jump = [B("⏮ В начало", pg(kind, flt, sort, 0))] if page > 0 else []
+            if page + 5 < pages:
+                jump.append(B("⏩ +5 стр.", pg(kind, flt, sort, page + 5)))
+            if jump:
+                rows.append(jump)
+    else:
+        hint = ("В этом городе подходящих вакансий нет — выбери другой или увеличь радиус."
+                if label else "Ничего не подходит. Попробуй ослабить фильтры в настройках.")
+        parts = [f"{header}\n\n{hint}"]
+
+    # города из настроек — быстрый фильтр
+    if s["cities"]:
+        chips = [B(check(not flt) + "Все", pg(kind, "", sort, 0))]
+        for i, c in enumerate(s["cities"]):
+            active = flt in (f"c{i}", f"co{i}")
+            chips.append(B(check(active) + c["name"][:16], pg(kind, f"c{i}", sort, 0)))
+        rows += [chips[k:k + 3] for k in range(0, len(chips), 3)]
+    if city:
+        i = s["cities"].index(city)
+        rows.append([
+            B(check(flt == f"co{i}") + f"Только {city['name'][:14]}", pg(kind, f"co{i}", sort, 0)),
+            B(check(flt == f"c{i}") + f"До {city['radius']} км", pg(kind, f"c{i}", sort, 0)),
+        ])
+    rows.append([B(check(sort == key) + name, pg(kind, flt, key, 0))
+                 for key, (name, _) in SORTS.items() if key != "d" or s["cities"]])
+    rows.append([B("🗺 По городам", f"oc:{kind}"), B("⚙️ Настройки", "st:main")])
     return "\n\n".join(parts), InlineKeyboardMarkup(rows)
 
 
-def list_for(chat_id: int, kind: str, page: int):
+def base_matches(chat_id: int, kind: str, s: dict) -> tuple[list, str]:
+    if kind.startswith("n") and kind[1:].isdigit():
+        jobs = db.jobs_by_refnrs(db.batch_refnrs(chat_id, int(kind[1:])))
+        return matching.match_jobs(jobs, s), "🆕 Новые вакансии"
+    return matching.match_jobs(db.active_jobs(), s), "📋 Подходящие вакансии"
+
+
+def list_for(chat_id: int, kind: str, page: int = 0, flt: str = "", sort: str = "s", context=None):
     s = db.get_settings(chat_id)
-    if kind == "a":
-        matched = matching.match_jobs(db.active_jobs(), s)
-        title = "📋 Подходящие вакансии"
-    else:
-        batch = int(kind[1:])
-        matched = matching.match_jobs(db.jobs_by_refnrs(db.batch_refnrs(chat_id, batch)), s)
-        title = "🆕 Новые вакансии"
-    return render_list(matched, page, kind, title)
+    matched, title = base_matches(chat_id, kind, s)
+    ort_opts = context.chat_data.get("ort_opts", []) if context else []
+    return render_list(matched, s, kind, title, flt, sort, page, ort_opts)
+
+
+def cities_overview(chat_id: int, kind: str, context) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран «По городам»: сколько подходящих вакансий где, с кнопками перехода."""
+    s = db.get_settings(chat_id)
+    matched, _ = base_matches(chat_id, kind, s)
+    lines = ["🗺 <b>Вакансии по городам</b>", f"Всего подходит: {len(matched)}"]
+    rows = []
+    if s["cities"]:
+        lines.append("\n<b>Твои города:</b>")
+        for i, c in enumerate(s["cities"]):
+            only = sum(1 for job, _, _ in matched if matching.in_city(job, c, True))
+            near = sum(1 for job, _, _ in matched if matching.in_city(job, c, False))
+            lines.append(f"📍 {esc(c['name'])}: в самом городе {only}, до {c['radius']} км — {near}")
+            rows.append([
+                B(f"📍 {c['name'][:14]} ({only})", pg(kind, f"co{i}", "s", 0)),
+                B(f"до {c['radius']} км ({near})", pg(kind, f"c{i}", "d", 0)),
+            ])
+    counts: dict[str, int] = {}
+    for job, _, _ in matched:
+        if job["ort"]:
+            counts[job["ort"]] = counts.get(job["ort"], 0) + 1
+    top = sorted(counts.items(), key=lambda x: -x[1])[:12]
+    context.chat_data["ort_opts"] = [ort for ort, _ in top]
+    if top:
+        lines.append("\n<b>Где больше всего подходящих вакансий:</b>")
+        buttons = [B(f"{ort[:20]} ({n})", pg(kind, f"o{i}", "s", 0)) for i, (ort, n) in enumerate(top)]
+        rows += [buttons[k:k + 2] for k in range(0, len(buttons), 2)]
+    rows.append([B("➕ Добавить свой город", "ct:addl")])
+    rows.append([B("⬅️ К списку", pg(kind, "", "s", 0))])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ============================================================== настройки
@@ -579,7 +688,9 @@ def menu(section: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, s: dict
     if section == "cities":
         rows = [[B(f"❌ {c['name']} ({c['radius']} км)", f"ct:del:{i}")] for i, c in enumerate(s["cities"])]
         rows.append([B("➕ Добавить город", "ct:add")])
-        text = "🏙 <b>Города</b>\nВакансии в радиусе от выбранных городов. Нажми на город, чтобы убрать его."
+        text = ("🏙 <b>Города</b>\nВакансии в радиусе от выбранных городов. Нажми на город, чтобы убрать его.\n\n"
+                "Если выбраны ещё и земли, в список попадают и вакансии из этих земель. Чтобы смотреть "
+                "только один город, нажми на его кнопку над списком вакансий или открой «🗺 По городам».")
         return text, InlineKeyboardMarkup(rows + [back])
 
     if section == "branchen":
@@ -666,14 +777,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "noop":
         return
     if data.startswith("pg:"):
-        kind, page = data[3:].rsplit(":", 1)
-        text, kb = list_for(chat_id, kind, int(page))
+        parts = data[3:].split(":")
+        if len(parts) == 2:  # кнопки из сообщений до обновления
+            kind, flt, sort, page = parts[0], "", "s", parts[1]
+        else:
+            kind, flt, sort, page = parts
+        text, kb = list_for(chat_id, kind, int(page), flt, sort, context)
         return await edit(query, text, kb)
     if data == "ls":
-        text, kb = list_for(chat_id, "a", 0)
+        text, kb = list_for(chat_id, "a", context=context)
+        return await edit(query, text, kb)
+    if data.startswith("oc:"):
+        text, kb = cities_overview(chat_id, data[3:], context)
         return await edit(query, text, kb)
 
     context.chat_data.pop("await", None)  # любая кнопка отменяет ожидание ввода
+    context.chat_data.pop("after_city", None)
     s = db.get_settings(chat_id)
     section = "main"
     prompt = None
@@ -726,11 +845,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         s["min_start"], section = data[3:], "start"
     elif data in ("tm:add", "ct:add", "ex:add"):
         prompt = {"tm:add": "term", "ct:add": "city", "ex:add": "excl"}[data]
+    elif data == "ct:addl":  # добавить город из экрана «По городам»
+        prompt = "city"
+        context.chat_data["after_city"] = "list"
 
     if prompt:
         context.chat_data["await"] = prompt
         back_section, text = PROMPTS[prompt]
-        kb = InlineKeyboardMarkup([[B("Отмена", f"st:{back_section}")]])
+        back = "oc:a" if context.chat_data.get("after_city") else f"st:{back_section}"
+        kb = InlineKeyboardMarkup([[B("Отмена", back)]])
         return await edit(query, f"✏️ {text}", kb)
 
     db.save_settings(chat_id, s)
@@ -823,6 +946,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"Не нашёл город «{esc(name)}». Попробуй написать иначе, например по-немецки.")
             return
         s["cities"].append({"name": place["name"], "lat": place["lat"], "lon": place["lon"], "radius": radius})
+        if context.chat_data.pop("after_city", None):
+            # пришли из списка вакансий — сразу показываем вакансии в этом городе
+            db.save_settings(chat_id, s)
+            text, kb = list_for(chat_id, "a", 0, f"c{len(s['cities']) - 1}", "d", context)
+            await update.message.reply_text(text, reply_markup=kb)
+            return
     elif kind == "start":
         value = parse_start(text)
         if value is None:
@@ -880,7 +1009,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, kb = list_for(update.effective_chat.id, "a", 0)
+    text, kb = list_for(update.effective_chat.id, "a", context=context)
     await update.message.reply_text(text, reply_markup=kb)
 
 
