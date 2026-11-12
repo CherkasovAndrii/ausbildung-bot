@@ -53,14 +53,15 @@ API_BASE = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service"
 # Эндпоинты поиска в порядке предпочтения; бот запоминает первый рабочий.
 # API_URL в .env позволяет задать конкретный адрес вручную.
 API_URLS = [os.getenv("API_URL")] if os.getenv("API_URL") else [
-    f"{API_BASE}/pc/v4/app/jobs",
     f"{API_BASE}/pc/v6/jobs",
+    f"{API_BASE}/pc/v4/app/jobs",
     f"{API_BASE}/pc/v4/jobs",
 ]
 API_HEADERS = {"X-API-Key": "jobboerse-jobsuche", "User-Agent": "ausbildung-bot/1.0"}
 ANGEBOTSART_AUSBILDUNG = 4                          # Ausbildung / Duales Studium
 PAGE_SIZE = 100
 JOB_URL = "https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}"
+SCHEMA_VERSION = "2"
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
@@ -108,6 +109,13 @@ def init_db() -> None:
             );
             """
         )
+    # Схема 2: вакансии, сохранённые до поддержки формата v6, были без дат и мест.
+    # Очищаем их один раз, чтобы первая проверка прошла заново. Подписки остаются.
+    if get_meta("schema") != SCHEMA_VERSION:
+        with db() as con:
+            con.execute("DELETE FROM jobs")
+            con.execute("DELETE FROM meta WHERE key='last_check'")
+        set_meta("schema", SCHEMA_VERSION)
 
 
 def get_meta(key: str) -> str | None:
@@ -131,12 +139,17 @@ def get_chats() -> list[int]:
 
 
 def save_jobs(rows: list[dict], now: str) -> list[dict]:
-    """Обновляет last_seen у известных вакансий, добавляет новые. Возвращает новые."""
+    """Обновляет данные и last_seen у известных вакансий, добавляет новые.
+    Возвращает новые."""
     new = []
     with db() as con:
         for row in rows:
             cur = con.execute(
-                "UPDATE jobs SET last_seen=? WHERE refnr=?", (now, row["refnr"])
+                "UPDATE jobs SET titel=:titel, beruf=:beruf, arbeitgeber=:arbeitgeber, "
+                "plz=:plz, ort=:ort, region=:region, eintrittsdatum=:eintrittsdatum, "
+                "veroeffentlicht=:veroeffentlicht, externe_url=:externe_url, last_seen=:now "
+                "WHERE refnr=:refnr",
+                {**row, "now": now},
             )
             if cur.rowcount == 0:
                 con.execute(
@@ -204,34 +217,55 @@ def _text(value) -> str:
     return str(value or "").strip()
 
 
+def _datum(value) -> str:
+    """Дата ГГГГ-ММ-ДД из строки или из периода вида {"von": "..."} (v6)."""
+    if isinstance(value, dict):
+        value = value.get("von") or ""
+    return str(value or "")[:10]
+
+
+def _region(value: str) -> str:
+    """THUERINGEN / BADEN_WUERTTEMBERG (v6) -> Thüringen / Baden-Württemberg."""
+    if not value.isupper():
+        return value
+    name = value.replace("_", "-").title()
+    return name.replace("Wuerttemberg", "Württemberg").replace("Thueringen", "Thüringen")
+
+
 def normalize(item: dict, term: str) -> dict | None:
     """Вакансия из ответа API (v4 или v6) -> строка для таблицы jobs."""
     global _SAMPLE_LOGGED
     if not _SAMPLE_LOGGED:
         _SAMPLE_LOGGED = True
-        log.info("Образец вакансии из API: %s", json.dumps(item, ensure_ascii=False)[:800])
+        log.info("Образец вакансии из API: %s", json.dumps(item, ensure_ascii=False)[:2500])
     refnr = _text(_first(item, "refnr", "referenznummer"))
     if not refnr:
         return None
-    ort = _first(item, "arbeitsort", "arbeitsorte") or {}
-    if isinstance(ort, list):  # в v6 места работы списком
+    # место: v4 — arbeitsort (dict), v6 — stellenlokationen[].adresse
+    ort = _first(item, "arbeitsort", "arbeitsorte", "stellenlokationen") or {}
+    if isinstance(ort, list):
         ort = ort[0] if ort else {}
     if not isinstance(ort, dict):
         ort = {"ort": str(ort)}
-    datum = _text(_first(
-        item, "aktuelleVeroeffentlichungsdatum", "ersteVeroeffentlichungsdatum",
-        "veroeffentlichungsdatum", "modifikationsTimestamp",
+    if isinstance(ort.get("adresse"), dict):
+        ort = ort["adresse"]
+    datum = _datum(_first(
+        item, "aktuelleVeroeffentlichungsdatum", "veroeffentlichungszeitraum",
+        "datumErsteVeroeffentlichung", "ersteVeroeffentlichungsdatum",
     ))
     return {
         "refnr": refnr,
         "titel": _text(_first(item, "titel", "stellenangebotsTitel", "stellenbezeichnung")),
         "beruf": _text(_first(item, "beruf", "hauptberuf", "berufsbezeichnung")),
-        "arbeitgeber": _text(_first(item, "arbeitgeber", "arbeitgeberName", "firma")),
+        "arbeitgeber": _text(_first(
+            item, "arbeitgeber", "arbeitgeberName", "arbeitgeberdarstellung", "firma",
+            "unternehmen",
+        )),
         "plz": str(ort["plz"]).zfill(5) if ort.get("plz") else "",
         "ort": _text(ort.get("ort")),
-        "region": _text(ort.get("region")),
-        "eintrittsdatum": _text(item.get("eintrittsdatum"))[:10],
-        "veroeffentlicht": datum[:10],
+        "region": _region(_text(ort.get("region"))),
+        "eintrittsdatum": _datum(_first(item, "eintrittsdatum", "eintrittszeitraum")),
+        "veroeffentlicht": datum,
         "externe_url": _text(_first(item, "externeUrl", "externeURL")),
         "suchbegriff": term,
     }
@@ -289,7 +323,7 @@ def format_job(row: dict) -> str:
     if row["arbeitgeber"]:
         lines.append(f"🏢 {esc(row['arbeitgeber'])}")
     place = " ".join(x for x in (row["plz"], row["ort"]) if x)
-    if row["region"] and row["region"] != row["ort"]:
+    if row["region"] and row["region"].lower() not in row["ort"].lower():
         place += f" ({row['region']})"
     info = []
     if place.strip():
