@@ -48,9 +48,14 @@ DB_PATH = os.getenv("DB_PATH") or os.path.join(
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ""), "jobs.db"
 )
 
-API_URL = os.getenv(
-    "API_URL", "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobs"
-)
+API_BASE = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service"
+# Эндпоинты поиска в порядке предпочтения; бот запоминает первый рабочий.
+# API_URL в .env позволяет задать конкретный адрес вручную.
+API_URLS = [os.getenv("API_URL")] if os.getenv("API_URL") else [
+    f"{API_BASE}/pc/v4/app/jobs",
+    f"{API_BASE}/pc/v6/jobs",
+    f"{API_BASE}/pc/v4/jobs",
+]
 API_HEADERS = {"X-API-Key": "jobboerse-jobsuche", "User-Agent": "ausbildung-bot/1.0"}
 ANGEBOTSART_AUSBILDUNG = 4                          # Ausbildung / Duales Studium
 PAGE_SIZE = 100
@@ -148,17 +153,34 @@ def save_jobs(rows: list[dict], now: str) -> list[dict]:
 
 
 async def get_json(client: httpx.AsyncClient, params: dict) -> dict:
-    """GET с тремя попытками."""
-    for attempt in range(3):
-        try:
-            resp = await client.get(API_URL, params=params)
-            resp.raise_for_status()
-            return resp.json()
-        except (httpx.HTTPError, ValueError):
-            if attempt == 2:
-                raise
-            await asyncio.sleep(2 * (attempt + 1))
-    return {}
+    """GET к API поиска. Если эндпоинт отвечает 403/404, пробует следующий.
+    Сетевые ошибки и 5xx повторяет до трёх раз."""
+    last_error: Exception | None = None
+    for url in list(API_URLS):
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, params=params)
+                if resp.status_code in (403, 404):
+                    log.warning("%s → %s: %s", url, resp.status_code, resp.text[:200])
+                    last_error = httpx.HTTPStatusError(
+                        f"{resp.status_code} от {url}", request=resp.request, response=resp
+                    )
+                    break  # к следующему эндпоинту
+                resp.raise_for_status()
+                data = resp.json()
+                if url != API_URLS[0]:
+                    API_URLS.remove(url)
+                    API_URLS.insert(0, url)
+                    log.info("Рабочий эндпоинт: %s", url)
+                if "stellenangebote" not in data:
+                    log.warning("Неожиданный ответ API, ключи: %s", list(data)[:20])
+                return data
+            except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as err:
+                last_error = err
+                if attempt == 2:
+                    break
+                await asyncio.sleep(2 * (attempt + 1))
+    raise last_error or RuntimeError("API недоступен")
 
 
 def normalize(item: dict, term: str) -> dict | None:
@@ -167,6 +189,8 @@ def normalize(item: dict, term: str) -> dict | None:
     if not refnr:
         return None
     ort = item.get("arbeitsort") or {}
+    if not ort and item.get("arbeitsorte"):  # в v6 места работы списком
+        ort = item["arbeitsorte"][0] or {}
     return {
         "refnr": refnr,
         "titel": item.get("titel") or item.get("stellenangebotsTitel") or "",
