@@ -110,3 +110,9 @@ def test_branch_filter_and_ranking():
 )
 def test_level_attached_to_right_language(text, level):
     assert parse_requirements(text)["de_level"] == level
+
+
+def test_zeitarbeit_filter():
+    assert evaluate(job(zeitarbeit=1), settings()) is not None
+    assert evaluate(job(zeitarbeit=1), settings(no_zeitarbeit=True)) is None
+    assert evaluate(job(zeitarbeit=0), settings(no_zeitarbeit=True)) is not None

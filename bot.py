@@ -227,7 +227,11 @@ async def scheduled_enrich(context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             async with api.client() as http:
                 done = await enrich(http, todo)
-            log.info("Описания вакансий: загружено %s из %s", done, len(todo))
+            log.info("Описания вакансий: загружено %s из %s, отраслей в базе: %s",
+                     done, len(todo), len(db.branch_counts()))
+            if api.DETAIL_KEYS and not context.bot_data.get("keys_logged"):
+                context.bot_data["keys_logged"] = True
+                log.info("Поля в описаниях вакансий: %s", ", ".join(sorted(api.DETAIL_KEYS)))
         await notify_all(context.bot)
     except Exception:
         log.exception("Ошибка загрузки описаний")
@@ -321,6 +325,7 @@ def settings_text(s: dict) -> str:
         f"🇩🇪 <b>Мой немецкий:</b> {de}",
         f"🗓 <b>Начало:</b> {'с ' + de_date(s['min_start']) if s['min_start'] else 'любое'}",
         f"🎓 <b>Duales Studium:</b> {'показывать' if s['dual'] else 'скрывать'}",
+        f"🏭 <b>Zeitarbeit и агентства:</b> {'скрывать' if s['no_zeitarbeit'] else 'показывать'}",
         f"🔔 <b>Уведомления:</b> {'вкл' if s['notify'] else 'выкл'}",
     ])
 
@@ -422,7 +427,8 @@ def menu(section: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, s: dict
         [B("🏙 Города", "st:cities"), B("🏢 Отрасли", "st:branchen")],
         [B("🚫 Исключения", "st:excl"), B("🇩🇪 Немецкий", "st:de")],
         [B("🗓 Начало", "st:start"), B(f"🎓 Duales Studium: {'да' if s['dual'] else 'нет'}", "tg:dual")],
-        [B(f"🔔 Уведомления: {'вкл' if s['notify'] else 'выкл'}", "tg:notify")],
+        [B(f"🏭 Zeitarbeit: {'скрыта' if s['no_zeitarbeit'] else 'да'}", "tg:zeit"),
+         B(f"🔔 Уведомления: {'вкл' if s['notify'] else 'выкл'}", "tg:notify")],
         [B(f"📋 Показать подходящие ({count})", "ls")],
     ]
     text = f"⚙️ <b>Настройки поиска</b>\n\n{settings_text(s)}\n\nСейчас подходит: <b>{count}</b>"
@@ -467,6 +473,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         s["dual"] = not s["dual"]
     elif data == "tg:notify":
         s["notify"] = not s["notify"]
+    elif data == "tg:zeit":
+        s["no_zeitarbeit"] = not s["no_zeitarbeit"]
     elif data in ("tg:strict", "tg:unk"):
         key = "strict" if data == "tg:strict" else "hide_unknown"
         s[key] = not s[key]

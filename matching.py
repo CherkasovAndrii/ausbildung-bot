@@ -178,6 +178,8 @@ def evaluate(job: dict, s: dict) -> tuple[int, list[str]] | None:
     """Оценка по требованиям. None — не подходит; иначе (баллы, значки)."""
     if s["branchen"] and (job.get("branchengruppe") or "") not in s["branchen"]:
         return None
+    if s.get("no_zeitarbeit") and job.get("zeitarbeit"):
+        return None
     score, badges = 0, []
     user = LEVELS.index(s["de_level"])
     kind, level = job.get("de_kind") or "", job.get("de_level") or ""

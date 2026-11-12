@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from config import ACTIVE_WINDOW_HOURS, DB_PATH, DEFAULT_TERMS
 
 FMT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 DEFAULT_SETTINGS = {
     "terms": [],          # профессии (заполняется DEFAULT_TERMS)
@@ -21,6 +21,7 @@ DEFAULT_SETTINGS = {
     "strict": False,      # скрывать вакансии с «sehr gute Deutschkenntnisse»
     "hide_unknown": False,  # скрывать, если уровень немецкого не указан
     "dual": True,         # показывать Duales Studium
+    "no_zeitarbeit": False,  # скрывать Zeitarbeit и частные кадровые агентства
     "notify": True,       # присылать уведомления о новых
 }
 
@@ -53,6 +54,7 @@ JOB_COLUMNS = [
     ("de_kind", "TEXT DEFAULT ''"),         # exact / hard / soft / ok / ''
     ("de_hint", "TEXT DEFAULT ''"),         # фраза из описания
     ("positive", "TEXT DEFAULT ''"),        # Sprachkurs, für Geflüchtete, international
+    ("zeitarbeit", "INTEGER DEFAULT 0"),    # Arbeitnehmerüberlassung или частное агентство
 ]
 CHAT_COLUMNS = [
     ("chat_id", "INTEGER PRIMARY KEY"),
@@ -101,6 +103,9 @@ def init_db() -> None:
             con.execute(
                 "UPDATE jobs SET is_initial=1, begriffe='|' || suchbegriff || '|' WHERE begriffe=''"
             )
+        elif schema == "3":
+            # в схеме 3 не сохранялся признак Zeitarbeit — перезагрузим описания
+            con.execute("UPDATE jobs SET details_status=NULL WHERE details_status='ok'")
         con.execute("UPDATE chats SET notify_since=? WHERE notify_since=''", (now_str(),))
     set_meta("schema", SCHEMA_VERSION)
 
@@ -253,8 +258,8 @@ def save_details(refnr: str, info: dict | None, status: str, now: str) -> None:
         con.execute(
             "UPDATE jobs SET details_status=:status, details_at=:now, beschreibung=:beschreibung, "
             "branchengruppe=:branchengruppe, branche=:branche, fluechtlinge=:fluechtlinge, "
-            "de_level=:de_level, de_kind=:de_kind, de_hint=:de_hint, positive=:positive "
-            "WHERE refnr=:refnr",
+            "de_level=:de_level, de_kind=:de_kind, de_hint=:de_hint, positive=:positive, "
+            "zeitarbeit=:zeitarbeit WHERE refnr=:refnr",
             {**info, "status": status, "now": now, "refnr": refnr},
         )
 

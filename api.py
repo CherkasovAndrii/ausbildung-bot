@@ -29,6 +29,7 @@ ANGEBOTSART_AUSBILDUNG = 4  # Ausbildung / Duales Studium
 PAGE_SIZE = 100
 
 _logged_samples: set[str] = set()
+DETAIL_KEYS: set[str] = set()  # все поля, встреченные в описаниях (для диагностики)
 
 
 class ApiError(Exception):
@@ -160,6 +161,8 @@ async def fetch_term(http: httpx.AsyncClient, term: str) -> list[dict]:
         if data is None:
             raise ApiError("все эндпоинты поиска ответили 403/404")
         items = data.get("stellenangebote") or data.get("ergebnisliste") or []
+        if data.get("facetten"):
+            _sample("фасетов поиска", {"facetten": data["facetten"]}, 4000)
         rows += [r for r in (normalize(i, term) for i in items) if r]
         total = int(data.get("maxErgebnisse") or 0)
         if len(items) < PAGE_SIZE or (total and page * PAGE_SIZE >= total):
@@ -182,11 +185,13 @@ async def fetch_details(http: httpx.AsyncClient, refnr: str) -> dict | None:
         data, "stellenangebotsBeschreibung", "stellenbeschreibung", "beschreibung",
         "stellenangebotsbeschreibung",
     )
+    DETAIL_KEYS.update(data)
     return {
         "beschreibung": str(text or ""),
-        "branchengruppe": _text(data.get("branchengruppe")),
-        "branche": _text(data.get("branche")),
+        "branchengruppe": _text(_first(data, "branchengruppe", "branchenGruppe", "wirtschaftszweig")),
+        "branche": _text(_first(data, "branche", "branchenbezeichnung")),
         "fluechtlinge": 1 if data.get("fuerFluechtlingeGeeignet") else 0,
+        "zeitarbeit": 1 if data.get("istArbeitnehmerUeberlassung") or data.get("istPrivateArbeitsvermittlung") else 0,
     }
 
 
