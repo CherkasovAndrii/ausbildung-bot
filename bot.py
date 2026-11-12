@@ -6,6 +6,7 @@ Bundesagentur für Arbeit и копит историю в SQLite.
 
 import asyncio
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -172,7 +173,7 @@ async def get_json(client: httpx.AsyncClient, params: dict) -> dict:
                     API_URLS.remove(url)
                     API_URLS.insert(0, url)
                     log.info("Рабочий эндпоинт: %s", url)
-                if "stellenangebote" not in data:
+                if not any(k in data for k in ("stellenangebote", "ergebnisliste")):
                     log.warning("Неожиданный ответ API, ключи: %s", list(data)[:20])
                 return data
             except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as err:
@@ -183,25 +184,55 @@ async def get_json(client: httpx.AsyncClient, params: dict) -> dict:
     raise last_error or RuntimeError("API недоступен")
 
 
+_SAMPLE_LOGGED = False
+
+
+def _first(item: dict, *keys: str):
+    """Первое непустое поле из списка возможных названий."""
+    for key in keys:
+        if item.get(key):
+            return item[key]
+    return None
+
+
+def _text(value) -> str:
+    """Строка из значения, которое в разных версиях API бывает str, dict или list."""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, dict):
+        value = _first(value, "bezeichnung", "name", "titel", "kurzBezeichnung") or ""
+    return str(value or "").strip()
+
+
 def normalize(item: dict, term: str) -> dict | None:
-    """Вакансия из ответа API -> строка для таблицы jobs."""
-    refnr = item.get("refnr") or item.get("referenznummer")
+    """Вакансия из ответа API (v4 или v6) -> строка для таблицы jobs."""
+    global _SAMPLE_LOGGED
+    if not _SAMPLE_LOGGED:
+        _SAMPLE_LOGGED = True
+        log.info("Образец вакансии из API: %s", json.dumps(item, ensure_ascii=False)[:800])
+    refnr = _text(_first(item, "refnr", "referenznummer"))
     if not refnr:
         return None
-    ort = item.get("arbeitsort") or {}
-    if not ort and item.get("arbeitsorte"):  # в v6 места работы списком
-        ort = item["arbeitsorte"][0] or {}
+    ort = _first(item, "arbeitsort", "arbeitsorte") or {}
+    if isinstance(ort, list):  # в v6 места работы списком
+        ort = ort[0] if ort else {}
+    if not isinstance(ort, dict):
+        ort = {"ort": str(ort)}
+    datum = _text(_first(
+        item, "aktuelleVeroeffentlichungsdatum", "ersteVeroeffentlichungsdatum",
+        "veroeffentlichungsdatum", "modifikationsTimestamp",
+    ))
     return {
         "refnr": refnr,
-        "titel": item.get("titel") or item.get("stellenangebotsTitel") or "",
-        "beruf": item.get("beruf") or "",
-        "arbeitgeber": item.get("arbeitgeber") or "",
+        "titel": _text(_first(item, "titel", "stellenangebotsTitel", "stellenbezeichnung")),
+        "beruf": _text(_first(item, "beruf", "hauptberuf", "berufsbezeichnung")),
+        "arbeitgeber": _text(_first(item, "arbeitgeber", "arbeitgeberName", "firma")),
         "plz": str(ort["plz"]).zfill(5) if ort.get("plz") else "",
-        "ort": ort.get("ort") or "",
-        "region": ort.get("region") or "",
-        "eintrittsdatum": (item.get("eintrittsdatum") or "")[:10],
-        "veroeffentlicht": (item.get("aktuelleVeroeffentlichungsdatum") or "")[:10],
-        "externe_url": item.get("externeUrl") or "",
+        "ort": _text(ort.get("ort")),
+        "region": _text(ort.get("region")),
+        "eintrittsdatum": _text(item.get("eintrittsdatum"))[:10],
+        "veroeffentlicht": datum[:10],
+        "externe_url": _text(_first(item, "externeUrl", "externeURL")),
         "suchbegriff": term,
     }
 
@@ -220,7 +251,7 @@ async def fetch_term(client: httpx.AsyncClient, term: str) -> list[dict]:
             params["wo"] = WO
             params["umkreis"] = UMKREIS
         data = await get_json(client, params)
-        items = data.get("stellenangebote") or []
+        items = data.get("stellenangebote") or data.get("ergebnisliste") or []
         rows += [r for r in (normalize(i, term) for i in items) if r]
         total = int(data.get("maxErgebnisse") or 0)
         if len(items) < PAGE_SIZE or (total and page * PAGE_SIZE >= total):
@@ -310,7 +341,8 @@ async def broadcast(bot, messages: list[str], chats: list[int] | None = None) ->
 async def run_check(bot) -> str:
     """Опрашивает API, сохраняет историю, рассылает новое. Возвращает итог строкой."""
     async with CHECK_LOCK:
-        first_run = get_meta("last_check") is None
+        with db() as con:  # первый запуск = в базе ещё нет ни одной вакансии
+            first_run = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         found, new, errors = 0, [], []
 
