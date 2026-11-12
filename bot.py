@@ -477,7 +477,14 @@ def main() -> None:
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
-    app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .defaults(defaults)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("check", cmd_check))
@@ -487,7 +494,8 @@ def main() -> None:
         scheduled_check, interval=CHECK_INTERVAL_HOURS * 3600, first=10
     )
     log.info("Бот запущен. Запросы: %s", "; ".join(SEARCH_TERMS))
-    app.run_polling()
+    # -1: при старте бесконечно повторять подключение к Telegram, а не падать
+    app.run_polling(bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
