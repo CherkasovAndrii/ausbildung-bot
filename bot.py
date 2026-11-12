@@ -1,309 +1,64 @@
-"""Telegram-бот: присылает новые вакансии Ausbildung из Jobsuche API
-Bundesagentur für Arbeit и копит историю в SQLite.
+"""Telegram-бот: вакансии Ausbildung из Jobsuche API Bundesagentur für Arbeit.
 
-Запуск:  python bot.py   (настройки — в файле .env, см. .env.example)
+Фильтры настраиваются прямо в боте (/settings), вакансии показываются списком
+с листанием, а по описанию каждой вакансии бот определяет требования к немецкому
+и скрывает те, где нужен уровень выше твоего.
+
+Запуск: python bot.py   (переменные окружения — см. .env.example)
 """
 
 import asyncio
 import html
 import json
 import logging
-import os
-import sqlite3
-from datetime import date, datetime, timedelta
+import re
+import time
+from datetime import datetime, timedelta
 
 import httpx
-from dotenv import load_dotenv
-from telegram import LinkPreviewOptions, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Update,
+)
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, Defaults
-
-load_dotenv()
-
-# ---------------------------------------------------------------- настройки
-
-
-def _list(name: str, default: str = "") -> list[str]:
-    """Значение из .env вида 'a;b;c' -> ['a', 'b', 'c']."""
-    return [x.strip() for x in os.getenv(name, default).split(";") if x.strip()]
-
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-SEARCH_TERMS = _list(
-    "SEARCH_TERMS",
-    "Fachinformatiker Systemintegration;"
-    "Fachinformatiker Anwendungsentwicklung;"
-    "Kaufmann für Digitalisierungsmanagement",
-)
-WO = os.getenv("WO", "").strip()                    # пусто = вся Германия
-UMKREIS = int(os.getenv("UMKREIS", "50"))           # км вокруг WO
-EXCLUDE_WORDS = [w.lower() for w in _list("EXCLUDE_WORDS")]
-MIN_START = os.getenv("MIN_START", "").strip()      # напр. 2027-01-01
-CHECK_INTERVAL_HOURS = float(os.getenv("CHECK_INTERVAL_HOURS", "6"))
-FIRST_RUN_DAYS = int(os.getenv("FIRST_RUN_DAYS", "3"))
-MAX_NOTIFY = int(os.getenv("MAX_NOTIFY", "60"))     # максимум вакансий за одну рассылку
-MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))       # страниц по 100 на один запрос
-# На Railway база кладётся на подключённый Volume, чтобы переживать деплои
-DB_PATH = os.getenv("DB_PATH") or os.path.join(
-    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ""), "jobs.db"
+from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    Defaults,
+    MessageHandler,
+    filters,
 )
 
-API_BASE = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service"
-# Эндпоинты поиска в порядке предпочтения; бот запоминает первый рабочий.
-# API_URL в .env позволяет задать конкретный адрес вручную.
-API_URLS = [os.getenv("API_URL")] if os.getenv("API_URL") else [
-    f"{API_BASE}/pc/v6/jobs",
-    f"{API_BASE}/pc/v4/app/jobs",
-    f"{API_BASE}/pc/v4/jobs",
-]
-API_HEADERS = {"X-API-Key": "jobboerse-jobsuche", "User-Agent": "ausbildung-bot/1.0"}
-ANGEBOTSART_AUSBILDUNG = 4                          # Ausbildung / Duales Studium
-PAGE_SIZE = 100
-JOB_URL = "https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}"
-SCHEMA_VERSION = "2"
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
+import api
+import db
+import matching
+from config import (
+    BOT_TOKEN,
+    CHECK_INTERVAL_HOURS,
+    DEFAULT_TERMS,
+    ENRICH_BATCH,
+    ENRICH_INTERVAL_MIN,
 )
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("ausbildung-bot")
 
-CHECK_LOCK = asyncio.Lock()
-
-# ------------------------------------------------------------------- база
-
-
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+LOCK = asyncio.Lock()       # одна операция с API за раз
+PAGE_SIZE = 5
+MAX_TERMS = 10
+JOB_URL = "https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}"
+esc = html.escape
 
 
-def init_db() -> None:
-    with db() as con:
-        con.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                refnr          TEXT PRIMARY KEY,
-                titel          TEXT,
-                beruf          TEXT,
-                arbeitgeber    TEXT,
-                plz            TEXT,
-                ort            TEXT,
-                region         TEXT,
-                eintrittsdatum TEXT,
-                veroeffentlicht TEXT,
-                externe_url    TEXT,
-                suchbegriff    TEXT,
-                first_seen     TEXT NOT NULL,
-                last_seen      TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id  INTEGER PRIMARY KEY,
-                added_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """
-        )
-    # Схема 2: вакансии, сохранённые до поддержки формата v6, были без дат и мест.
-    # Очищаем их один раз, чтобы первая проверка прошла заново. Подписки остаются.
-    if get_meta("schema") != SCHEMA_VERSION:
-        with db() as con:
-            con.execute("DELETE FROM jobs")
-            con.execute("DELETE FROM meta WHERE key='last_check'")
-        set_meta("schema", SCHEMA_VERSION)
-
-
-def get_meta(key: str) -> str | None:
-    with db() as con:
-        row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else None
-
-
-def set_meta(key: str, value: str) -> None:
-    with db() as con:
-        con.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-
-
-def get_chats() -> list[int]:
-    with db() as con:
-        return [r["chat_id"] for r in con.execute("SELECT chat_id FROM chats")]
-
-
-def save_jobs(rows: list[dict], now: str) -> list[dict]:
-    """Обновляет данные и last_seen у известных вакансий, добавляет новые.
-    Возвращает новые."""
-    new = []
-    with db() as con:
-        for row in rows:
-            cur = con.execute(
-                "UPDATE jobs SET titel=:titel, beruf=:beruf, arbeitgeber=:arbeitgeber, "
-                "plz=:plz, ort=:ort, region=:region, eintrittsdatum=:eintrittsdatum, "
-                "veroeffentlicht=:veroeffentlicht, externe_url=:externe_url, last_seen=:now "
-                "WHERE refnr=:refnr",
-                {**row, "now": now},
-            )
-            if cur.rowcount == 0:
-                con.execute(
-                    "INSERT INTO jobs VALUES "
-                    "(:refnr, :titel, :beruf, :arbeitgeber, :plz, :ort, :region, "
-                    ":eintrittsdatum, :veroeffentlicht, :externe_url, :suchbegriff, "
-                    ":now, :now)",
-                    {**row, "now": now},
-                )
-                new.append(row)
-    return new
-
-
-# -------------------------------------------------------------------- API
-
-
-async def get_json(client: httpx.AsyncClient, params: dict) -> dict:
-    """GET к API поиска. Если эндпоинт отвечает 403/404, пробует следующий.
-    Сетевые ошибки и 5xx повторяет до трёх раз."""
-    last_error: Exception | None = None
-    for url in list(API_URLS):
-        for attempt in range(3):
-            try:
-                resp = await client.get(url, params=params)
-                if resp.status_code in (403, 404):
-                    log.warning("%s → %s: %s", url, resp.status_code, resp.text[:200])
-                    last_error = httpx.HTTPStatusError(
-                        f"{resp.status_code} от {url}", request=resp.request, response=resp
-                    )
-                    break  # к следующему эндпоинту
-                resp.raise_for_status()
-                data = resp.json()
-                if url != API_URLS[0]:
-                    API_URLS.remove(url)
-                    API_URLS.insert(0, url)
-                    log.info("Рабочий эндпоинт: %s", url)
-                if not any(k in data for k in ("stellenangebote", "ergebnisliste")):
-                    log.warning("Неожиданный ответ API, ключи: %s", list(data)[:20])
-                return data
-            except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as err:
-                last_error = err
-                if attempt == 2:
-                    break
-                await asyncio.sleep(2 * (attempt + 1))
-    raise last_error or RuntimeError("API недоступен")
-
-
-_SAMPLE_LOGGED = False
-
-
-def _first(item: dict, *keys: str):
-    """Первое непустое поле из списка возможных названий."""
-    for key in keys:
-        if item.get(key):
-            return item[key]
-    return None
-
-
-def _text(value) -> str:
-    """Строка из значения, которое в разных версиях API бывает str, dict или list."""
-    if isinstance(value, list):
-        value = value[0] if value else ""
-    if isinstance(value, dict):
-        value = _first(value, "bezeichnung", "name", "titel", "kurzBezeichnung") or ""
-    return str(value or "").strip()
-
-
-def _datum(value) -> str:
-    """Дата ГГГГ-ММ-ДД из строки или из периода вида {"von": "..."} (v6)."""
-    if isinstance(value, dict):
-        value = value.get("von") or ""
-    return str(value or "")[:10]
-
-
-def _region(value: str) -> str:
-    """THUERINGEN / BADEN_WUERTTEMBERG (v6) -> Thüringen / Baden-Württemberg."""
-    if not value.isupper():
-        return value
-    name = value.replace("_", "-").title()
-    return name.replace("Wuerttemberg", "Württemberg").replace("Thueringen", "Thüringen")
-
-
-def normalize(item: dict, term: str) -> dict | None:
-    """Вакансия из ответа API (v4 или v6) -> строка для таблицы jobs."""
-    global _SAMPLE_LOGGED
-    if not _SAMPLE_LOGGED:
-        _SAMPLE_LOGGED = True
-        log.info("Образец вакансии из API: %s", json.dumps(item, ensure_ascii=False)[:2500])
-    refnr = _text(_first(item, "refnr", "referenznummer"))
-    if not refnr:
-        return None
-    # место: v4 — arbeitsort (dict), v6 — stellenlokationen[].adresse
-    ort = _first(item, "arbeitsort", "arbeitsorte", "stellenlokationen") or {}
-    if isinstance(ort, list):
-        ort = ort[0] if ort else {}
-    if not isinstance(ort, dict):
-        ort = {"ort": str(ort)}
-    if isinstance(ort.get("adresse"), dict):
-        ort = ort["adresse"]
-    datum = _datum(_first(
-        item, "aktuelleVeroeffentlichungsdatum", "veroeffentlichungszeitraum",
-        "datumErsteVeroeffentlichung", "ersteVeroeffentlichungsdatum",
-    ))
-    return {
-        "refnr": refnr,
-        "titel": _text(_first(item, "titel", "stellenangebotsTitel", "stellenbezeichnung")),
-        "beruf": _text(_first(item, "beruf", "hauptberuf", "berufsbezeichnung")),
-        "arbeitgeber": _text(_first(
-            item, "arbeitgeber", "arbeitgeberName", "arbeitgeberdarstellung", "firma",
-            "unternehmen",
-        )),
-        "plz": str(ort["plz"]).zfill(5) if ort.get("plz") else "",
-        "ort": _text(ort.get("ort")),
-        "region": _region(_text(ort.get("region"))),
-        "eintrittsdatum": _datum(_first(item, "eintrittsdatum", "eintrittszeitraum")),
-        "veroeffentlicht": datum,
-        "externe_url": _text(_first(item, "externeUrl", "externeURL")),
-        "suchbegriff": term,
-    }
-
-
-async def fetch_term(client: httpx.AsyncClient, term: str) -> list[dict]:
-    """Все вакансии Ausbildung по одному поисковому запросу (с пагинацией)."""
-    rows: list[dict] = []
-    for page in range(1, MAX_PAGES + 1):
-        params = {
-            "angebotsart": ANGEBOTSART_AUSBILDUNG,
-            "was": term,
-            "page": page,
-            "size": PAGE_SIZE,
-        }
-        if WO:
-            params["wo"] = WO
-            params["umkreis"] = UMKREIS
-        data = await get_json(client, params)
-        items = data.get("stellenangebote") or data.get("ergebnisliste") or []
-        rows += [r for r in (normalize(i, term) for i in items) if r]
-        total = int(data.get("maxErgebnisse") or 0)
-        if len(items) < PAGE_SIZE or (total and page * PAGE_SIZE >= total):
-            break
-        await asyncio.sleep(0.5)  # не долбим API
-    return rows
-
-
-# ------------------------------------------------------- фильтры и формат
-
-
-def wanted(row: dict) -> bool:
-    text = f"{row['titel']} {row['beruf']}".lower()
-    if any(word in text for word in EXCLUDE_WORDS):
-        return False
-    if MIN_START and row["eintrittsdatum"] and row["eintrittsdatum"] < MIN_START:
-        return False
-    return True
+def B(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=data)
 
 
 def de_date(iso: str) -> str:
@@ -314,163 +69,607 @@ def de_date(iso: str) -> str:
         return iso
 
 
-def format_job(row: dict) -> str:
-    esc = html.escape
-    title = row["titel"] or row["beruf"] or "Ausbildung"
-    lines = [f"<b>{esc(title)}</b>"]
-    if row["beruf"] and row["beruf"] != title:
-        lines.append(f"<i>{esc(row['beruf'])}</i>")
-    if row["arbeitgeber"]:
-        lines.append(f"🏢 {esc(row['arbeitgeber'])}")
-    place = " ".join(x for x in (row["plz"], row["ort"]) if x)
-    if row["region"] and row["region"].lower() not in row["ort"].lower():
-        place += f" ({row['region']})"
-    info = []
-    if place.strip():
-        info.append(f"📍 {esc(place.strip())}")
-    if row["eintrittsdatum"]:
-        info.append(f"🗓 начало {de_date(row['eintrittsdatum'])}")
-    if info:
-        lines.append(" · ".join(info))
-    links = [f'<a href="{esc(JOB_URL.format(refnr=row["refnr"]))}">Открыть вакансию</a>']
-    if row["externe_url"]:
-        links.append(f'<a href="{esc(row["externe_url"])}">сайт работодателя</a>')
-    published = f" · опубл. {de_date(row['veroeffentlicht'])}" if row["veroeffentlicht"] else ""
-    lines.append(" | ".join(links) + published)
-    return "\n".join(lines)
+# =================================================== загрузка и уведомления
 
 
-def chunk_messages(header: str, rows: list[dict], limit: int = 3900) -> list[str]:
-    """Склеивает вакансии в сообщения не длиннее лимита Telegram (4096)."""
-    messages, current = [], header
-    for row in rows:
-        block = format_job(row)
-        if len(current) + len(block) + 2 > limit:
-            messages.append(current)
-            current = block
-        else:
-            current = f"{current}\n\n{block}" if current else block
-    if current:
-        messages.append(current)
-    return messages
+def all_terms() -> list[str]:
+    """Профессии всех подписчиков — по ним идёт поиск в API."""
+    terms: list[str] = []
+    for chat in db.get_chats():
+        terms += [t for t in chat["settings"]["terms"] if t not in terms]
+    return terms or list(DEFAULT_TERMS)
 
 
-async def broadcast(bot, messages: list[str], chats: list[int] | None = None) -> None:
-    for chat_id in chats if chats is not None else get_chats():
-        for text in messages:
-            try:
-                await bot.send_message(chat_id, text)
-                await asyncio.sleep(0.5)
-            except Forbidden:  # пользователь заблокировал бота
-                with db() as con:
-                    con.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
+async def fetch_and_store(http: httpx.AsyncClient, terms: list[str]) -> tuple[int, list[dict], list[str]]:
+    """Загружает вакансии по профессиям. Возвращает (найдено, новые, ошибки)."""
+    now = db.now_str()
+    fetched = set(json.loads(db.get_meta("terms_fetched") or "[]"))
+    empty_db = db.job_count() == 0
+    found, new, errors = 0, [], []
+    for term in terms:
+        try:
+            rows = await api.fetch_term(http, term)
+        except (httpx.HTTPError, api.ApiError) as err:
+            log.error("Запрос «%s» не удался: %s", term, err)
+            errors.append(term)
+            continue
+        found += len(rows)
+        # первая загрузка профессии — это не «новые» вакансии, а вся база по ней
+        initial = empty_db or term not in fetched
+        new += [dict(r, is_initial=initial) for r in db.save_jobs(rows, now, initial)]
+        fetched.add(term)
+    db.set_meta("terms_fetched", json.dumps(sorted(fetched), ensure_ascii=False))
+    return found, new, errors
+
+
+def jobs_needing_details(limit: int, only: set[str] | None = None) -> list[str]:
+    """Вакансии без описания, которые подходят хоть одному подписчику по базовым фильтрам."""
+    chats = db.get_chats()
+    if not chats:
+        return []
+    retry_before = (datetime.now() - timedelta(days=1)).strftime(db.FMT)
+    todo = [
+        j for j in db.active_jobs()
+        if (only is None or j["refnr"] in only)
+        and (j["details_status"] is None
+             or (j["details_status"] == "fail" and (j["details_at"] or "") < retry_before))
+        and any(matching.prefilter(j, c["settings"]) for c in chats)
+    ]
+    todo.sort(key=lambda j: j["veroeffentlicht"] or "", reverse=True)
+    todo.sort(key=lambda j: j["is_initial"])  # сначала новые
+    return [j["refnr"] for j in todo[:limit]]
+
+
+async def enrich(http: httpx.AsyncClient, refnrs: list[str]) -> int:
+    """Загружает описания вакансий и разбирает требования. Возвращает число успешных."""
+    pause = db.get_meta("details_pause_until") or ""
+    if pause > db.now_str():
+        return 0
+    done, fails_in_row = 0, 0
+    for refnr in refnrs:
+        now = db.now_str()
+        try:
+            info = await api.fetch_details(http, refnr)
+        except httpx.HTTPError as err:
+            log.warning("Детали %s: %s", refnr, err)
+            info = None
+        if info is None:
+            db.save_details(refnr, None, "fail", now)
+            fails_in_row += 1
+            if fails_in_row >= 15:
+                until = (datetime.now() + timedelta(hours=6)).strftime(db.FMT)
+                db.set_meta("details_pause_until", until)
+                log.error("Описания вакансий недоступны (15 ошибок подряд), пауза до %s", until)
                 break
-            except TelegramError as err:
-                log.warning("Не удалось отправить в %s: %s", chat_id, err)
-
-
-# --------------------------------------------------------------- проверка
+        else:
+            info.update(matching.parse_requirements(info["beschreibung"]))
+            db.save_details(refnr, info, "ok", now)
+            done += 1
+            fails_in_row = 0
+        await asyncio.sleep(0.3)
+    return done
 
 
 async def run_check(bot) -> str:
-    """Опрашивает API, сохраняет историю, рассылает новое. Возвращает итог строкой."""
-    async with CHECK_LOCK:
-        with db() as con:  # первый запуск = в базе ещё нет ни одной вакансии
-            first_run = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        found, new, errors = 0, [], []
+    """Проверка: загрузка вакансий, описания для новых, уведомления."""
+    async with LOCK:
+        terms = all_terms()
+        async with api.client() as http:
+            found, new, errors = await fetch_and_store(http, terms)
+            if len(errors) < len(terms):
+                db.set_meta("last_check", db.now_str())
+            fresh = {r["refnr"] for r in new if not r["is_initial"]}
+            if fresh:
+                todo = jobs_needing_details(len(fresh), only=fresh)
+                await enrich(http, todo)
+                db.mark_details_failed(list(fresh), db.now_str())  # чтобы не ждать их вечно
+    sent = await notify_all(bot)
+    summary = f"Найдено в API: {found}, новых: {len(fresh)}, отправлено уведомлений: {sent}."
+    if errors:
+        summary += "\n⚠️ Не удалось запросить: " + ", ".join(errors)
+    log.info(summary.replace("\n", " "))
+    return summary
 
-        async with httpx.AsyncClient(headers=API_HEADERS, timeout=30) as client:
-            for term in SEARCH_TERMS:
-                try:
-                    rows = await fetch_term(client, term)
-                except (httpx.HTTPError, ValueError) as err:
-                    log.error("Запрос «%s» не удался: %s", term, err)
-                    errors.append(term)
-                    continue
-                found += len(rows)
-                new += save_jobs(rows, now)
 
-        if len(errors) < len(SEARCH_TERMS):
-            set_meta("last_check", now)
-
-        to_send = [r for r in new if wanted(r)]
-        if first_run:
-            # при первом запуске в базу попадает всё, а в чат — только свежее
-            cutoff = (date.today() - timedelta(days=FIRST_RUN_DAYS)).isoformat()
-            to_send = [r for r in to_send if r["veroeffentlicht"] >= cutoff]
-        to_send.sort(key=lambda r: r["veroeffentlicht"], reverse=True)
-        extra = max(0, len(to_send) - MAX_NOTIFY)
-        to_send = to_send[:MAX_NOTIFY]
-
-        if to_send:
-            if first_run:
-                header = (
-                    f"👋 Первая проверка: в базе {len(new)} вакансий. "
-                    f"Свежие за {FIRST_RUN_DAYS} дн.: {len(to_send) + extra}"
-                )
-            else:
-                header = f"🆕 Новых вакансий: {len(to_send) + extra}"
-            messages = chunk_messages(header, to_send)
-            if extra:
-                messages.append(
-                    f"…и ещё {extra}. Чтобы приходило меньше, сузь фильтры в .env "
-                    "(WO, EXCLUDE_WORDS, MIN_START)."
-                )
-            await broadcast(bot, messages)
-
-        summary = f"Найдено в API: {found}, новых в базе: {len(new)}, отправлено: {len(to_send)}."
-        if errors:
-            summary += "\n⚠️ Не удалось запросить: " + ", ".join(errors)
-        log.info(summary.replace("\n", " "))
-        return summary
+async def notify_all(bot) -> int:
+    """Каждому подписчику — одно сообщение со списком новых подходящих вакансий."""
+    jobs = db.active_jobs()
+    total = 0
+    for chat in db.get_chats():
+        chat_id, s = chat["chat_id"], chat["settings"]
+        if not s["notify"]:
+            continue
+        seen = db.notified_set(chat_id)
+        candidates = [
+            j for j in jobs
+            if not j["is_initial"] and j["first_seen"] >= chat["notify_since"]
+            and j["details_status"] is not None and j["refnr"] not in seen
+        ]
+        if not candidates:
+            continue
+        matched = matching.match_jobs(candidates, s)
+        matched_ids = {j["refnr"] for j, _, _ in matched}
+        # неподходящие тоже помечаем, чтобы не рассматривать их повторно
+        db.mark_notified(chat_id, [j["refnr"] for j in candidates if j["refnr"] not in matched_ids], 0)
+        if not matched:
+            continue
+        batch = int(time.time())
+        db.mark_notified(chat_id, list(matched_ids), batch)
+        text, kb = render_list(matched, 0, f"n{batch}", f"🆕 Новых подходящих вакансий: {len(matched)}")
+        try:
+            await bot.send_message(chat_id, text, reply_markup=kb)
+            total += len(matched)
+        except Forbidden:
+            db.remove_chat(chat_id)
+        except TelegramError as err:
+            log.warning("Не удалось отправить в %s: %s", chat_id, err)
+    return total
 
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not get_chats():
+    if not db.get_chats():
         log.info("Подписчиков нет — жду /start")
         return
     try:
         await run_check(context.bot)
-    except Exception:  # фоновая задача не должна падать
+    except Exception:
         log.exception("Ошибка плановой проверки")
 
 
-# ---------------------------------------------------------------- команды
+async def scheduled_enrich(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фоном подтягивает описания уже известных вакансий."""
+    if LOCK.locked():
+        return
+    try:
+        async with LOCK:
+            todo = jobs_needing_details(ENRICH_BATCH)
+            if not todo:
+                return
+            async with api.client() as http:
+                done = await enrich(http, todo)
+            log.info("Описания вакансий: загружено %s из %s", done, len(todo))
+        await notify_all(context.bot)
+    except Exception:
+        log.exception("Ошибка загрузки описаний")
 
 
-def settings_text() -> str:
-    lines = ["<b>Что ищу:</b>"] + [f"• {html.escape(t)}" for t in SEARCH_TERMS]
-    lines.append(f"<b>Где:</b> {html.escape(WO) + f' (+{UMKREIS} км)' if WO else 'вся Германия'}")
-    if EXCLUDE_WORDS:
-        lines.append("<b>Исключаю:</b> " + html.escape(", ".join(EXCLUDE_WORDS)))
-    if MIN_START:
-        lines.append(f"<b>Начало не раньше:</b> {de_date(MIN_START)}")
-    lines.append(f"<b>Проверка:</b> каждые {CHECK_INTERVAL_HOURS:g} ч")
-    return "\n".join(lines)
+# ================================================================= список
+
+
+def format_item(n: int, job: dict, badges: list[str]) -> str:
+    title = job["titel"] or job["beruf"] or "Ausbildung"
+    lines = [f"<b>{n}. {esc(title)}</b>"]
+    where = " ".join(x for x in (job["plz"], job["ort"]) if x)
+    if job["region"] and job["region"].lower() not in (job["ort"] or "").lower():
+        where += f" ({job['region']})"
+    sub = [f"🏢 {esc(job['arbeitgeber'])}" if job["arbeitgeber"] else "", f"📍 {esc(where)}" if where.strip() else ""]
+    lines.append(" · ".join(x for x in sub if x))
+    info = [f"🗓 с {de_date(job['eintrittsdatum'])}" if job["eintrittsdatum"] else ""] + [esc(b) for b in badges]
+    lines.append(" · ".join(x for x in info if x))
+    links = [f'<a href="{esc(JOB_URL.format(refnr=job["refnr"]))}">Открыть</a>']
+    if job["externe_url"]:
+        links.append(f'<a href="{esc(job["externe_url"])}">сайт фирмы</a>')
+    if job["veroeffentlicht"]:
+        links.append(f"опубл. {de_date(job['veroeffentlicht'])}")
+    lines.append(" · ".join(links))
+    return "\n".join(line for line in lines if line)
+
+
+def render_list(matched: list, page: int, kind: str, title: str):
+    """Страница списка вакансий с кнопками листания. kind: a — все, n<batch> — новые."""
+    if not matched:
+        text = f"{title}\n\nНичего не подходит. Попробуй ослабить фильтры в настройках."
+        return text, InlineKeyboardMarkup([[B("⚙️ Настройки", "st:main")]])
+    pages = (len(matched) + PAGE_SIZE - 1) // PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    chunk = matched[start:start + PAGE_SIZE]
+    parts = [f"{title}\n<i>Сначала самые подходящие · {start + 1}–{start + len(chunk)} из {len(matched)}</i>"]
+    parts += [format_item(start + i + 1, job, badges) for i, (job, _, badges) in enumerate(chunk)]
+    nav = []
+    if page > 0:
+        nav.append(B("◀️", f"pg:{kind}:{page - 1}"))
+    nav.append(B(f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        nav.append(B("▶️", f"pg:{kind}:{page + 1}"))
+    rows = [nav]
+    if pages > 3:
+        jump = [B("⏮ В начало", f"pg:{kind}:0")] if page > 0 else []
+        if page + 5 < pages:
+            jump.append(B("⏩ +5 стр.", f"pg:{kind}:{page + 5}"))
+        if jump:
+            rows.append(jump)
+    rows.append([B("⚙️ Настройки", "st:main")])
+    return "\n\n".join(parts), InlineKeyboardMarkup(rows)
+
+
+def list_for(chat_id: int, kind: str, page: int):
+    s = db.get_settings(chat_id)
+    if kind == "a":
+        matched = matching.match_jobs(db.active_jobs(), s)
+        title = "📋 Подходящие вакансии"
+    else:
+        batch = int(kind[1:])
+        matched = matching.match_jobs(db.jobs_by_refnrs(db.batch_refnrs(chat_id, batch)), s)
+        title = "🆕 Новые вакансии"
+    return render_list(matched, page, kind, title)
+
+
+# ============================================================== настройки
+
+
+def _short(items: list[str], empty: str, limit: int = 4) -> str:
+    if not items:
+        return empty
+    text = ", ".join(items[:limit])
+    return text + (f" и ещё {len(items) - limit}" if len(items) > limit else "")
+
+
+def settings_text(s: dict) -> str:
+    cities = [f"{c['name']} ({c['radius']} км)" for c in s["cities"]]
+    de = s["de_level"]
+    if s["strict"]:
+        de += ", строго"
+    if s["hide_unknown"]:
+        de += ", без уровня скрывать"
+    return "\n".join([
+        f"🔎 <b>Профессии:</b> {esc(_short(s['terms'], '— (ничего не ищу)'))}",
+        f"🗺 <b>Земли:</b> {esc(_short(s['laender'], 'все'))}",
+        f"🏙 <b>Города:</b> {esc(_short(cities, '—'))}",
+        f"🏢 <b>Отрасли:</b> {esc(_short(s['branchen'], 'все', 2))}",
+        f"🚫 <b>Исключения:</b> {esc(_short(s['exclude'], '—'))}",
+        f"🇩🇪 <b>Мой немецкий:</b> {de}",
+        f"🗓 <b>Начало:</b> {'с ' + de_date(s['min_start']) if s['min_start'] else 'любое'}",
+        f"🎓 <b>Duales Studium:</b> {'показывать' if s['dual'] else 'скрывать'}",
+        f"🔔 <b>Уведомления:</b> {'вкл' if s['notify'] else 'выкл'}",
+    ])
+
+
+PROMPTS = {
+    "term": ("terms", "Напиши профессию так, как её ищут на сайте Arbeitsagentur.\n"
+                      "Например: <code>Mechatroniker</code> или <code>Kaufmann für Büromanagement</code>."),
+    "city": ("cities", "Напиши город и, если нужно, радиус в км.\n"
+                       "Например: <code>Cottbus 50</code> или <code>Leipzig</code> (по умолчанию 50 км)."),
+    "excl": ("excl", "Напиши слова через запятую. Вакансии, где они есть в названии, профессии "
+                     "или названии фирмы, будут скрыты.\nНапример: <code>Duales Studium, Zeitarbeit</code>."),
+    "start": ("start", "С какой даты начало тебе подходит? Например: <code>2027</code>, "
+                       "<code>08.2027</code> или <code>01.08.2027</code>. Сбросить: <code>-</code>."),
+}
+
+
+def menu(section: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, s: dict | None = None):
+    """Текст и кнопки раздела настроек."""
+    s = s or db.get_settings(chat_id)
+    back = [B("⬅️ Назад", "st:main")]
+    check = lambda on: "✅ " if on else ""  # noqa: E731
+
+    if section == "terms":
+        rows = [[B(f"❌ {t}", f"tm:del:{i}")] for i, t in enumerate(s["terms"])]
+        if len(s["terms"]) < MAX_TERMS:
+            rows.append([B("➕ Добавить профессию", "tm:add")])
+        text = ("🔎 <b>Профессии</b>\nБот ищет вакансии Ausbildung по этим названиям по всей Германии. "
+                "Нажми на профессию, чтобы убрать её.")
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    if section == "laender":
+        names = matching.LAENDER
+        rows = [
+            [B(check(n in s["laender"]) + n, f"ld:{i}") for i, n in list(enumerate(names))[k:k + 2]]
+            for k in range(0, len(names), 2)
+        ]
+        rows.append([B(check(not s["laender"]) + "Вся Германия", "ld:all")])
+        text = ("🗺 <b>Федеральные земли</b>\nОтметь нужные. Если выбраны и земли, и города, "
+                "подходят вакансии из любой выбранной земли или в радиусе любого города.")
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    if section == "cities":
+        rows = [[B(f"❌ {c['name']} ({c['radius']} км)", f"ct:del:{i}")] for i, c in enumerate(s["cities"])]
+        rows.append([B("➕ Добавить город", "ct:add")])
+        text = "🏙 <b>Города</b>\nВакансии в радиусе от выбранных городов. Нажми на город, чтобы убрать его."
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    if section == "branchen":
+        options = db.branch_counts()
+        names = [n for n, _ in options]
+        names += [n for n in s["branchen"] if n not in names]
+        context.chat_data["br_opts"] = names
+        counts = dict(options)
+        rows = [[B(f"{check(n in s['branchen'])}{n[:40]} ({counts.get(n, 0)})", f"br:{i}")]
+                for i, n in enumerate(names)]
+        rows.append([B(check(not s["branchen"]) + "Все отрасли", "br:all")])
+        text = ("🏢 <b>Отрасли работодателя</b>\nЧем занимается фирма, по данным Arbeitsagentur. "
+                "В скобках — число активных вакансий.")
+        if not options:
+            text += "\n\n⏳ Данные об отраслях ещё собираются из описаний вакансий, загляни позже."
+        else:
+            text += "\nЕсли выбрать отрасли, вакансии с ещё не загруженным описанием скрываются."
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    if section == "excl":
+        rows = [[B(f"❌ {w}", f"ex:del:{i}")] for i, w in enumerate(s["exclude"])]
+        rows.append([B("➕ Добавить слова", "ex:add")])
+        text = "🚫 <b>Исключения</b>\nСкрываю вакансии с этими словами в названии, профессии или фирме."
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    if section == "de":
+        levels = [B(check(lv == s["de_level"]) + lv, f"de:{lv}") for lv in matching.LEVELS[1:]]
+        rows = [
+            levels,
+            [B(check(s["strict"]) + "Скрывать «sehr gute / fließend»", "tg:strict")],
+            [B(check(s["hide_unknown"]) + "Скрывать, если уровень не указан", "tg:unk")],
+        ]
+        text = ("🇩🇪 <b>Мой немецкий</b>\nБот читает описание каждой вакансии и скрывает те, где "
+                "требуют уровень выше твоего (например, C1 или «Muttersprache»).\n\n"
+                "• «sehr gute / fließende Deutschkenntnisse» — обычно это C1, но не всегда. "
+                "По умолчанию такие вакансии показываются с пометкой ⚠️.\n"
+                "• В большинстве объявлений уровень не указан, они помечены «не указан».")
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    if section == "start":
+        year = datetime.now().year
+        rows = [
+            [B(check(s["min_start"] == f"{y}-01-01") + f"с {y}", f"ms:{y}-01-01") for y in (year, year + 1)],
+            [B(check(s["min_start"] == f"{year + 1}-08-01") + f"с 01.08.{year + 1}", f"ms:{year + 1}-08-01")],
+            [B("✏️ Своя дата", "ms:custom"), B(check(not s["min_start"]) + "Любое", "ms:")],
+        ]
+        text = "🗓 <b>Начало Ausbildung</b>\nСкрываю вакансии, которые начинаются раньше выбранной даты."
+        return text, InlineKeyboardMarkup(rows + [back])
+
+    # главное меню
+    count = len(matching.match_jobs(db.active_jobs(), s))
+    rows = [
+        [B("🔎 Профессии", "st:terms"), B("🗺 Земли", "st:laender")],
+        [B("🏙 Города", "st:cities"), B("🏢 Отрасли", "st:branchen")],
+        [B("🚫 Исключения", "st:excl"), B("🇩🇪 Немецкий", "st:de")],
+        [B("🗓 Начало", "st:start"), B(f"🎓 Duales Studium: {'да' if s['dual'] else 'нет'}", "tg:dual")],
+        [B(f"🔔 Уведомления: {'вкл' if s['notify'] else 'выкл'}", "tg:notify")],
+        [B(f"📋 Показать подходящие ({count})", "ls")],
+    ]
+    text = f"⚙️ <b>Настройки поиска</b>\n\n{settings_text(s)}\n\nСейчас подходит: <b>{count}</b>"
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def edit(query, text: str, kb) -> None:
+    try:
+        await query.edit_message_text(text, reply_markup=kb)
+    except BadRequest as err:
+        if "not modified" not in str(err).lower():
+            raise
+
+
+def _toggle(items: list, value) -> None:
+    items.remove(value) if value in items else items.append(value)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data or ""
+    chat_id = query.message.chat.id
+    await query.answer()
+    if data == "noop":
+        return
+    if data.startswith("pg:"):
+        kind, page = data[3:].rsplit(":", 1)
+        text, kb = list_for(chat_id, kind, int(page))
+        return await edit(query, text, kb)
+    if data == "ls":
+        text, kb = list_for(chat_id, "a", 0)
+        return await edit(query, text, kb)
+
+    context.chat_data.pop("await", None)  # любая кнопка отменяет ожидание ввода
+    s = db.get_settings(chat_id)
+    section = "main"
+    prompt = None
+
+    if data.startswith("st:"):
+        section = data[3:]
+    elif data == "tg:dual":
+        s["dual"] = not s["dual"]
+    elif data == "tg:notify":
+        s["notify"] = not s["notify"]
+    elif data in ("tg:strict", "tg:unk"):
+        key = "strict" if data == "tg:strict" else "hide_unknown"
+        s[key] = not s[key]
+        section = "de"
+    elif data.startswith("de:"):
+        s["de_level"], section = data[3:], "de"
+    elif data == "ld:all":
+        s["laender"], section = [], "laender"
+    elif data.startswith("ld:"):
+        _toggle(s["laender"], matching.LAENDER[int(data[3:])])
+        section = "laender"
+    elif data.startswith("tm:del:"):
+        idx = int(data[7:])
+        if idx < len(s["terms"]):
+            s["terms"].pop(idx)
+        section = "terms"
+    elif data.startswith("ct:del:"):
+        idx = int(data[7:])
+        if idx < len(s["cities"]):
+            s["cities"].pop(idx)
+        section = "cities"
+    elif data.startswith("ex:del:"):
+        idx = int(data[7:])
+        if idx < len(s["exclude"]):
+            s["exclude"].pop(idx)
+        section = "excl"
+    elif data == "br:all":
+        s["branchen"], section = [], "branchen"
+    elif data.startswith("br:"):
+        options = context.chat_data.get("br_opts") or []
+        idx = int(data[3:])
+        if idx < len(options):
+            _toggle(s["branchen"], options[idx])
+        section = "branchen"
+    elif data == "ms:custom":
+        prompt = "start"
+    elif data.startswith("ms:"):
+        s["min_start"], section = data[3:], "start"
+    elif data in ("tm:add", "ct:add", "ex:add"):
+        prompt = {"tm:add": "term", "ct:add": "city", "ex:add": "excl"}[data]
+
+    if prompt:
+        context.chat_data["await"] = prompt
+        back_section, text = PROMPTS[prompt]
+        kb = InlineKeyboardMarkup([[B("Отмена", f"st:{back_section}")]])
+        return await edit(query, f"✏️ {text}", kb)
+
+    db.save_settings(chat_id, s)
+    text, kb = menu(section, chat_id, context, s)
+    await edit(query, text, kb)
+
+
+# ============================================================ ввод текста
+
+
+def parse_start(text: str) -> str | None:
+    """'2027', '08.2027', '01.08.2027', '2027-08-01', '-' -> ГГГГ-ММ-ДД или '' (сброс)."""
+    text = text.strip()
+    if text in ("-", "—", "сброс", "любое"):
+        return ""
+    for pattern, build in (
+        (r"^(\d{4})$", lambda m: f"{m[1]}-01-01"),
+        (r"^(\d{1,2})[./](\d{4})$", lambda m: f"{m[2]}-{int(m[1]):02d}-01"),
+        (r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", lambda m: f"{m[3]}-{int(m[2]):02d}-{int(m[1]):02d}"),
+        (r"^(\d{4})-(\d{2})-(\d{2})$", lambda m: m[0]),
+    ):
+        m = re.match(pattern, text)
+        if m:
+            value = build(m)
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+                return value
+            except ValueError:
+                return None
+    return None
+
+
+def parse_city(text: str) -> tuple[str, int]:
+    m = re.match(r"^(.*?)[\s,]+(\d{1,3})\s*(km|км)?$", text.strip(), re.IGNORECASE)
+    if m and m[1].strip():
+        return m[1].strip(), max(1, min(300, int(m[2])))
+    return text.strip(), 50
+
+
+async def load_new_term(app: Application, chat_id: int, term: str) -> None:
+    """Загружает вакансии по только что добавленной профессии."""
+    try:
+        async with LOCK:
+            async with api.client() as http:
+                found, _, errors = await fetch_and_store(http, [term])
+        if errors:
+            msg = f"⚠️ Не получилось загрузить вакансии по «{esc(term)}». Попробую при следующей проверке."
+        else:
+            msg = (f"Загрузил вакансии по «{esc(term)}»: {found}. Требования к немецкому "
+                   "подтянутся в течение часа.")
+        await app.bot.send_message(chat_id, msg, reply_markup=InlineKeyboardMarkup([[B("📋 Показать подходящие", "ls")]]))
+    except Exception:
+        log.exception("Ошибка загрузки профессии %s", term)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    kind = context.chat_data.pop("await", None)
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    if not kind:
+        await update.message.reply_text("Настройки поиска — /settings, список вакансий — /list.")
+        return
+    s = db.get_settings(chat_id)
+    section = PROMPTS[kind][0]
+    note = ""
+
+    if kind == "term":
+        term = text[:80]
+        if term and term not in s["terms"]:
+            s["terms"].append(term)
+            fetched = set(json.loads(db.get_meta("terms_fetched") or "[]"))
+            if term not in fetched:
+                note = f"⏳ Загружаю вакансии по «{esc(term)}», пришлю сообщение, когда закончу.\n\n"
+                context.application.create_task(load_new_term(context.application, chat_id, term))
+    elif kind == "excl":
+        for word in re.split(r"[,;\n]", text):
+            word = word.strip()
+            if word and word not in s["exclude"]:
+                s["exclude"].append(word)
+    elif kind == "city":
+        name, radius = parse_city(text)
+        place = None
+        try:
+            place = await api.geocode(name)
+        except httpx.HTTPError as err:
+            log.warning("Геокодер: %s", err)
+        place = place or db.city_coords(name)
+        if not place:
+            context.chat_data["await"] = kind
+            await update.message.reply_text(f"Не нашёл город «{esc(name)}». Попробуй написать иначе, например по-немецки.")
+            return
+        s["cities"].append({"name": place["name"], "lat": place["lat"], "lon": place["lon"], "radius": radius})
+    elif kind == "start":
+        value = parse_start(text)
+        if value is None:
+            context.chat_data["await"] = kind
+            await update.message.reply_text("Не понял дату. Примеры: 2027, 08.2027, 01.08.2027 или «-» для сброса.")
+            return
+        s["min_start"] = value
+
+    db.save_settings(chat_id, s)
+    menu_text, kb = menu(section, chat_id, context, s)
+    await update.message.reply_text(note + menu_text, reply_markup=kb)
+
+
+# ================================================================ команды
+
+
+HELP = (
+    "/list — подходящие вакансии списком\n"
+    "/settings — профессии, земли, города, отрасли, немецкий\n"
+    "/check — проверить новые вакансии сейчас\n"
+    "/stats — статистика\n"
+    "/stop — отписаться"
+)
+
+
+async def first_check(app: Application, chat_id: int) -> None:
+    try:
+        await run_check(app.bot)
+        count = len(matching.match_jobs(db.active_jobs(), db.get_settings(chat_id)))
+        await app.bot.send_message(
+            chat_id,
+            f"Готово! Подходящих вакансий: <b>{count}</b>. Требования к немецкому подтягиваются "
+            "в фоне, примерно за час.",
+            reply_markup=InlineKeyboardMarkup([[B("📋 Показать", "ls"), B("⚙️ Настройки", "st:main")]]),
+        )
+    except Exception:
+        log.exception("Ошибка первой проверки")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with db() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO chats VALUES (?, ?)",
-            (update.effective_chat.id, datetime.now().isoformat(timespec="seconds")),
-        )
-    await update.message.reply_text(
-        "Подписка включена — буду присылать новые вакансии Ausbildung.\n\n"
-        + settings_text()
-        + "\n\n/check — проверить сейчас\n/last — последние вакансии из базы\n"
-        "/stats — статистика\n/stop — отписаться"
+    chat_id = update.effective_chat.id
+    db.add_chat(chat_id)
+    s = db.get_settings(chat_id)
+    text = (
+        "Привет! Я ищу вакансии Ausbildung на сайте Bundesagentur für Arbeit, присылаю новые "
+        "и отсеиваю те, где требуют немецкий выше твоего уровня.\n\n"
+        f"{settings_text(s)}\n\n{HELP}"
     )
-    if get_meta("last_check") is None:
+    kb = InlineKeyboardMarkup([[B("📋 Подходящие вакансии", "ls")], [B("⚙️ Настройки", "st:main")]])
+    await update.message.reply_text(text, reply_markup=kb)
+    if db.get_meta("last_check") is None:
         await update.message.reply_text("Запускаю первую проверку, это займёт около минуты…")
-        context.application.create_task(scheduled_check(context))
+        context.application.create_task(first_check(context.application, chat_id))
 
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with db() as con:
-        con.execute("DELETE FROM chats WHERE chat_id=?", (update.effective_chat.id,))
-    await update.message.reply_text("Отписал. /start — подписаться снова.")
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = list_for(update.effective_chat.id, "a", 0)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.chat_data.pop("await", None)
+    if not db.is_subscribed(update.effective_chat.id):
+        db.add_chat(update.effective_chat.id)
+    text, kb = menu("main", update.effective_chat.id, context)
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,110 +679,91 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as err:
         log.exception("Ошибка проверки")
         summary = f"Ошибка: {err}"
-    await update.message.reply_text(html.escape(summary))
-
-
-async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        count = min(30, max(1, int(context.args[0])))
-    except (IndexError, ValueError):
-        count = 10
-    with db() as con:
-        rows = [dict(r) for r in con.execute(
-            "SELECT * FROM jobs ORDER BY veroeffentlicht DESC, first_seen DESC LIMIT 300"
-        )]
-    rows = [r for r in rows if wanted(r)][:count]
-    if not rows:
-        await update.message.reply_text("В базе пока пусто. Попробуй /check.")
-        return
-    await broadcast(
-        context.bot,
-        chunk_messages(f"Последние {len(rows)} вакансий в базе:", rows),
-        chats=[update.effective_chat.id],
-    )
+    await update.message.reply_text(esc(summary), reply_markup=InlineKeyboardMarkup([[B("📋 Показать подходящие", "ls")]]))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    last_check = get_meta("last_check")
-    if not last_check:
+    if not db.get_meta("last_check"):
         await update.message.reply_text("Статистики пока нет — сначала /check.")
         return
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-    with db() as con:
-        total = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-        active = con.execute(
-            "SELECT COUNT(*) FROM jobs WHERE last_seen >= ?", (last_check,)
-        ).fetchone()[0]
-        week = con.execute(
-            "SELECT COUNT(*) FROM jobs WHERE first_seen >= ?", (week_ago,)
-        ).fetchone()[0]
-        lifetime = con.execute(
-            "SELECT AVG(julianday(last_seen) - julianday(COALESCE(NULLIF(veroeffentlicht, ''), first_seen))) "
-            "FROM jobs WHERE last_seen < ?", (last_check,)
-        ).fetchone()[0]
-        by_term = con.execute(
-            "SELECT suchbegriff, COUNT(*) n FROM jobs WHERE last_seen >= ? "
-            "GROUP BY suchbegriff ORDER BY n DESC", (last_check,)
-        ).fetchall()
-        cities = con.execute(
-            "SELECT ort, COUNT(*) n FROM jobs WHERE last_seen >= ? AND ort != '' "
-            "GROUP BY ort ORDER BY n DESC LIMIT 5", (last_check,)
-        ).fetchall()
-        employers = con.execute(
-            "SELECT arbeitgeber, COUNT(*) n FROM jobs WHERE last_seen >= ? AND arbeitgeber != '' "
-            "GROUP BY arbeitgeber ORDER BY n DESC LIMIT 5", (last_check,)
-        ).fetchall()
-
-    esc = html.escape
+    st = db.stats()
+    s = db.get_settings(update.effective_chat.id)
+    jobs = db.active_jobs()
+    matched = matching.match_jobs(jobs, s)
+    base = [j for j in jobs if matching.prefilter(j, s)]
+    hidden_de = sum(1 for j in base if j["de_kind"] in ("exact", "hard")
+                    and matching.LEVELS.index(j["de_level"]) > matching.LEVELS.index(s["de_level"]))
     lines = [
         "<b>Статистика</b>",
-        f"Всего в базе: {total}",
-        f"Активных сейчас: {active}",
-        f"Новых за 7 дней: {week}",
+        f"Всего в базе: {st['total']}, активных: {st['active']}",
+        f"Новых за 7 дней: {st['week']}",
+        f"Описания загружены: {st['with_details']} из {st['active']}",
+        f"Уровень немецкого указан в {st['with_level']} описаниях",
+        "",
+        f"Под твои фильтры: {len(base)}, из них скрыто из-за немецкого: {hidden_de}",
+        f"Подходит: <b>{len(matched)}</b>",
     ]
-    if lifetime is not None:
-        lines.append(f"Закрытые вакансии висели в среднем {lifetime:.0f} дн.")
-    if by_term:
-        lines += ["", "<b>Активные по запросам:</b>"]
-        lines += [f"• {esc(r['suchbegriff'])} — {r['n']}" for r in by_term]
-    if cities:
-        lines += ["", "<b>Топ городов:</b>"]
-        lines += [f"• {esc(r['ort'])} — {r['n']}" for r in cities]
-    if employers:
-        lines += ["", "<b>Топ работодателей:</b>"]
-        lines += [f"• {esc(r['arbeitgeber'])} — {r['n']}" for r in employers]
-    lines += ["", f"Последняя проверка: {last_check}"]
+    if st["lifetime"] is not None:
+        lines.append(f"Закрытые вакансии висели в среднем {st['lifetime']:.0f} дн.")
+    cities: dict[str, int] = {}
+    firms: dict[str, int] = {}
+    for job, _, _ in matched:
+        if job["ort"]:
+            cities[job["ort"]] = cities.get(job["ort"], 0) + 1
+        if job["arbeitgeber"]:
+            firms[job["arbeitgeber"]] = firms.get(job["arbeitgeber"], 0) + 1
+    for title, data in (("Топ городов", cities), ("Топ работодателей", firms)):
+        top = sorted(data.items(), key=lambda x: -x[1])[:5]
+        if top:
+            lines += ["", f"<b>{title} (подходящие):</b>"] + [f"• {esc(k)} — {v}" for k, v in top]
+    lines += ["", f"Последняя проверка: {db.get_meta('last_check')}"]
     await update.message.reply_text("\n".join(lines))
 
 
-# ------------------------------------------------------------------ запуск
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP)
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db.remove_chat(update.effective_chat.id)
+    await update.message.reply_text("Отписал. /start — подписаться снова.")
+
+
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("list", "Подходящие вакансии"),
+        BotCommand("settings", "Настройки поиска"),
+        BotCommand("check", "Проверить сейчас"),
+        BotCommand("stats", "Статистика"),
+        BotCommand("help", "Команды"),
+        BotCommand("stop", "Отписаться"),
+    ])
 
 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN. Скопируй .env.example в .env и впиши токен.")
-    init_db()
-    defaults = Defaults(
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-    )
+    db.init_db()
+    defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .defaults(defaults)
         .connect_timeout(20)
         .read_timeout(20)
+        .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("last", cmd_last))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.job_queue.run_repeating(
-        scheduled_check, interval=CHECK_INTERVAL_HOURS * 3600, first=10
-    )
-    log.info("Бот запущен. Запросы: %s", "; ".join(SEARCH_TERMS))
+    for name, handler in (
+        ("start", cmd_start), ("list", cmd_list), ("last", cmd_list), ("settings", cmd_settings),
+        ("check", cmd_check), ("stats", cmd_stats), ("help", cmd_help), ("stop", cmd_stop),
+    ):
+        app.add_handler(CommandHandler(name, handler))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.job_queue.run_repeating(scheduled_check, interval=CHECK_INTERVAL_HOURS * 3600, first=10)
+    app.job_queue.run_repeating(scheduled_enrich, interval=ENRICH_INTERVAL_MIN * 60, first=90)
+    log.info("Бот запущен. Профессии: %s", "; ".join(all_terms()))
     # -1: при старте бесконечно повторять подключение к Telegram, а не падать
     app.run_polling(bootstrap_retries=-1)
 
