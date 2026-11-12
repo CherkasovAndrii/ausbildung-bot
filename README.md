@@ -51,3 +51,11 @@ import sqlite3, pandas as pd
 df = pd.read_sql("SELECT * FROM jobs", sqlite3.connect("jobs.db"))
 print(df.groupby("region").size().sort_values(ascending=False).head(10))
 ```
+
+## Деплой на Railway
+
+Проект берёт код из этого репозитория и пересобирается при каждом push в `main`.
+
+- Переменные (`BOT_TOKEN`, `SEARCH_TERMS` и другие) задаются в Railway: сервис → **Variables**.
+- База `jobs.db` лежит на Volume с путём `/data`, поэтому история не пропадает при редеплое.
+- Логи: сервис → **Deployments** → **View logs**.
